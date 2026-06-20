@@ -1,0 +1,603 @@
+//@version=6
+// daily-trender v12 — based on v11
+// Path: indicators/daily-trender/scripts/v12/daily_trender.pine
+// ADX + RVOL threshold color coding (Traders Lab style).
+
+indicator("Relative Strength vs Benchmark (Table)", overlay = true, behind_chart = false)
+
+// =========================================================================
+// INPUTS — Benchmark
+// =========================================================================
+benchmarkPreset = input.string("QQQ", "Benchmark", options = ["QQQ", "SPY", "SMH", "IWM", "Custom"], group = "Benchmark")
+benchmarkCustom = input.symbol("QQQ", "Custom Benchmark (used if 'Custom' selected above)", group = "Benchmark")
+benchmarkSym    = benchmarkPreset == "Custom" ? benchmarkCustom : benchmarkPreset
+
+// =========================================================================
+// INPUTS — Settings
+// =========================================================================
+maxSymbols     = input.int(12, "Max symbols to fetch", minval = 1, maxval = 18, group = "Settings",
+     tooltip = "Caps watchlist size. Lower if you hit memory limits.")
+sortByStrength = input.bool(true, "Sort table by strongest first (by Since Open spread)", group = "Settings")
+theme          = input.string("Dark", "Table Theme", options = ["Dark", "Light"], group = "Settings")
+sessionTz      = input.string("America/New_York", "Session Timezone", group = "Settings")
+
+posInput = input.string("Top Right", "Table Position",
+     options = ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = "Settings")
+
+textSize = input.string("Small", "Table Text Size", options = ["Tiny", "Small", "Normal", "Large"], group = "Settings")
+
+// =========================================================================
+// INPUTS — Table columns
+// =========================================================================
+gCols = "Table Columns"
+showBenchRow = input.bool(true,  "Show pinned benchmark row", group = gCols)
+showMov      = input.bool(true,  "Show Mov (% vs prior close)", group = gCols)
+showOpen     = input.bool(true,  "Show Open (% since RTH open)", group = gCols)
+showBenchCol = input.bool(true,  "Show Benchmark % column", group = gCols)
+showRS       = input.bool(true,  "Show RS (relative strength)", group = gCols)
+showPrevD    = input.bool(true,  "Show PrevD", group = gCols)
+showPreMkt   = input.bool(true,  "Show PreMkt", group = gCols)
+showTrend    = input.bool(true,  "Show Trend (alignment)", group = gCols)
+showYTrend   = input.bool(true,  "Show YTrend (yesterday vs prior range)", group = gCols)
+showADX      = input.bool(true,  "Show ADX", group = gCols)
+showRVOL     = input.bool(true,  "Show RVOL (relative volume)", group = gCols)
+
+gLvl = "Level Columns"
+showPDH  = input.bool(false, "Show PDH (prior day high)",  group = gLvl)
+showPDL  = input.bool(false, "Show PDL (prior day low)",   group = gLvl)
+showPMH  = input.bool(true,  "Show PMH (premarket high)", group = gLvl)
+showPML  = input.bool(true,  "Show PML (premarket low)",  group = gLvl)
+show5mH  = input.bool(true,  "Show 5m High (9:30–9:35)",  group = gLvl)
+show5mL  = input.bool(true,  "Show 5m Low (9:30–9:35)",   group = gLvl)
+
+// =========================================================================
+// INPUTS — ADX / RVOL thresholds
+// =========================================================================
+gInd = "ADX / RVOL"
+adxLen           = input.int(14, "ADX length", minval = 1, group = gInd)
+adxSmooth        = input.int(14, "ADX smoothing", minval = 1, group = gInd)
+adxMinThreshold  = input.float(20.0, "ADX min trend threshold", minval = 5, maxval = 40, step = 1, group = gInd,
+     tooltip = "Below this: choppy / stay out (red). Default 20.")
+adxStrongThreshold = input.float(25.0, "ADX strong trend threshold", minval = 10, maxval = 50, step = 1, group = gInd,
+     tooltip = "At or above with +DI > -DI: bullish momentum (green). At or above with -DI > +DI: bearish (red).")
+rvolLen          = input.int(20, "RVOL average length (bars)", minval = 2, group = gInd,
+     tooltip = "RVOL = current bar volume / SMA(volume, length) on chart TF.")
+rvolHighThreshold = input.float(2.0, "RVOL high (strong interest)", minval = 1.0, maxval = 5.0, step = 0.1, group = gInd,
+     tooltip = "At or above: high participation (green). Winning setup often pairs this with ADX > strong threshold.")
+rvolLowThreshold  = input.float(1.0, "RVOL low (weak interest)", minval = 0.1, maxval = 2.0, step = 0.1, group = gInd,
+     tooltip = "At or below: low participation — moves may lack follow-through (red).")
+
+needAdxRvol = showADX or showRVOL
+needYTrend  = showYTrend
+
+// =========================================================================
+// INPUTS — Tickers
+// =========================================================================
+g = "Tickers"
+sym1  = input.symbol("AAPL",  "Ticker 1",  group = g)
+sym2  = input.symbol("AMD",   "Ticker 2",  group = g)
+sym3  = input.symbol("AMZN",  "Ticker 3",  group = g)
+sym4  = input.symbol("PLTR",  "Ticker 4",  group = g)
+sym5  = input.symbol("TSLA",  "Ticker 5",  group = g)
+sym6  = input.symbol("SPCX",  "Ticker 6",  group = g)
+sym7  = input.symbol("NVDA",  "Ticker 7",  group = g)
+sym8  = input.symbol("MU",    "Ticker 8",  group = g)
+sym9  = input.symbol("BATS:SNDK", "Ticker 9",  group = g, tooltip = "Use the same exchange prefix as your chart")
+sym10 = input.symbol("HOOD",  "Ticker 10", group = g)
+sym11 = input.symbol("MRVL",  "Ticker 11", group = g)
+sym12 = input.symbol("CRDO",  "Ticker 12", group = g)
+sym13 = input.symbol("MSFT",  "Ticker 13", group = g)
+sym14 = input.symbol("GOOG",  "Ticker 14", group = g)
+sym15 = input.symbol("MSTR",  "Ticker 15", group = g)
+sym16 = input.symbol("AVGO",  "Ticker 16", group = g)
+sym17 = input.symbol("",      "Ticker 17 (optional)", group = g)
+sym18 = input.symbol("",      "Ticker 18 (optional)", group = g)
+
+// =========================================================================
+// THEME COLORS
+// =========================================================================
+bgMain     = theme == "Dark" ? color.new(color.black, 0) : color.new(color.white, 0)
+bgHeader   = theme == "Dark" ? color.new(#2a2e39, 0) : color.new(#e0e3eb, 0)
+bgBenchRow = theme == "Dark" ? color.new(#1a3a5c, 0) : color.new(#cfe3fa, 0)
+txtMain    = theme == "Dark" ? color.white : color.black
+neutralBg  = theme == "Dark" ? color.new(color.gray, 50) : color.new(color.gray, 75)
+posColor   = color.new(#26a69a, 0)
+negColor   = color.new(#ef5350, 0)
+warnBg     = color.new(#f59e0b, 0)
+bullAdxBg  = color.new(color.green, 0)
+bearAdxBg  = color.new(color.red, 0)
+weakAdxBg  = color.new(#9e9e9e, 0)
+
+totalCols = 1 +
+     (showMov ? 1 : 0) + (showOpen ? 1 : 0) + (showBenchCol ? 1 : 0) + (showRS ? 1 : 0) +
+     (showPrevD ? 1 : 0) + (showPreMkt ? 1 : 0) + (showTrend ? 1 : 0) + (showYTrend ? 1 : 0) +
+     (showADX ? 1 : 0) + (showRVOL ? 1 : 0) +
+     (showPDH ? 1 : 0) + (showPDL ? 1 : 0) + (showPMH ? 1 : 0) + (showPML ? 1 : 0) +
+     (show5mH ? 1 : 0) + (show5mL ? 1 : 0)
+
+// =========================================================================
+// BUILD SYMBOL LIST
+// =========================================================================
+allSyms = array.from(sym1, sym2, sym3, sym4, sym5, sym6, sym7, sym8, sym9, sym10, sym11, sym12, sym13, sym14, sym15, sym16, sym17, sym18)
+
+var string[] symbolList = array.new<string>()
+array.clear(symbolList)
+for raw in allSyms
+    t = str.upper(str.trim(raw))
+    if t != "" and not array.includes(symbolList, t) and array.size(symbolList) < maxSymbols
+        array.push(symbolList, t)
+
+n = array.size(symbolList)
+
+f_shortSymbol(full) =>
+    parts = str.split(full, ":")
+    array.size(parts) > 1 ? array.get(parts, 1) : full
+
+f_fmtPrice(v) =>
+    na(v) ? "—" : str.tostring(v, "#.##")
+
+f_fmtAdx(adx, pdi, mdi) =>
+    if na(adx)
+        "—"
+    else if not na(pdi) and not na(mdi) and adx >= adxStrongThreshold
+        str.tostring(adx, "#.#") + (pdi > mdi ? " ▲" : pdi < mdi ? " ▼" : "")
+    else
+        str.tostring(adx, "#.#")
+
+f_fmtRvol(v) =>
+    na(v) ? "—" : str.tostring(v, "#.#") + "x"
+
+f_rangeLabel(price, rangeHigh, rangeLow) =>
+    na(price) or na(rangeHigh) or na(rangeLow) ? "—" : price > rangeHigh ? "Above" : price < rangeLow ? "Below" : "Inside"
+
+f_adxBg(adx, pdi, mdi) =>
+    if na(adx)
+        neutralBg
+    else if adx < adxMinThreshold
+        weakAdxBg
+    else if adx < adxStrongThreshold
+        warnBg
+    else if not na(pdi) and not na(mdi) and pdi > mdi
+        bullAdxBg
+    else if not na(pdi) and not na(mdi) and pdi < mdi
+        bearAdxBg
+    else
+        warnBg
+
+f_rvolBg(v) =>
+    na(v) ? neutralBg : v >= rvolHighThreshold ? bullAdxBg : v <= rvolLowThreshold ? bearAdxBg : neutralBg
+
+f_adxRvol(diLen, adxSm, rvolL) =>
+    [pdi, mdi, adxVal] = ta.dmi(diLen, adxSm)
+    avgVol = ta.sma(volume, rvolL)
+    rvolVal = avgVol > 0 ? volume / avgVol : na
+    [adxVal, rvolVal, pdi, mdi]
+
+// =========================================================================
+// SESSION DATA — intraday tracking (release engine).
+// =========================================================================
+f_symbolSessionData() =>
+    var float pdh = na
+    var float pdl = na
+    var float sessH = na
+    var float sessL = na
+    var float dayOpen = na
+    var float prevClose = na
+    var float lastRTHClose = na
+    var float pmH = na
+    var float pmL = na
+    var float fiveH = na
+    var float fiveL = na
+
+    bool inPM     = not na(time(timeframe.period, "0400-0930:23456", sessionTz))
+    bool inRTH    = not na(time(timeframe.period, "0930-1600:23456", sessionTz))
+    bool inFirst5 = not na(time("5", "0930-0935:23456", sessionTz))
+    bool rthStart = inRTH and not inRTH[1]
+    bool newDay   = ta.change(time("D")) != 0
+
+    if newDay
+        if not na(sessH)
+            pdh := sessH
+            pdl := sessL
+        if not na(lastRTHClose)
+            prevClose := lastRTHClose
+        sessH := na
+        sessL := na
+        dayOpen := na
+        pmH := na
+        pmL := na
+        fiveH := na
+        fiveL := na
+        lastRTHClose := na
+
+    if inPM
+        pmH := na(pmH) ? high : math.max(pmH, high)
+        pmL := na(pmL) ? low  : math.min(pmL, low)
+
+    if inFirst5
+        fiveH := na(fiveH) ? high : math.max(fiveH, high)
+        fiveL := na(fiveL) ? low  : math.min(fiveL, low)
+
+    if rthStart
+        dayOpen := open
+
+    if inRTH
+        sessH := na(sessH) ? high : math.max(sessH, high)
+        sessL := na(sessL) ? low  : math.min(sessL, low)
+        lastRTHClose := close
+
+    [close, dayOpen, prevClose, pdh, pdl, pmH, pmL, fiveH, fiveL]
+
+// =========================================================================
+// YTrend — once per calendar day
+// =========================================================================
+var int      lastYtDay   = na
+var string   benchYTrend = "—"
+var string[] yTrendArr   = array.new<string>()
+
+int  currDay   = time("D")
+bool ytRefresh = needYTrend and n > 0 and (na(lastYtDay) or currDay != lastYtDay) and (barstate.isconfirmed or not barstate.isrealtime)
+
+if ytRefresh
+    lastYtDay := currDay
+    benchReg  = ticker.modify(benchmarkSym, session = session.regular)
+    [bYc, bPpdh, bPpdl] = request.security(benchReg, "D", [close[1], high[2], low[2]],
+         lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+    benchYTrend := f_rangeLabel(bYc, bPpdh, bPpdl)
+    array.clear(yTrendArr)
+    for i = 0 to n - 1
+        s      = array.get(symbolList, i)
+        regSym = ticker.modify(s, session = session.regular)
+        [yClose, ppdh, ppdl] = request.security(regSym, "D", [close[1], high[2], low[2]],
+             lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off, ignore_invalid_symbol = true)
+        array.push(yTrendArr, f_rangeLabel(yClose, ppdh, ppdl))
+
+// =========================================================================
+// INTRADAY — benchmark + per-symbol (every bar)
+// =========================================================================
+benchExt = ticker.modify(benchmarkSym, session = session.extended)
+[qqqNow, qqqOpen, qqqPdClose, qqqPdh, qqqPdl, qqqPmH, qqqPmL, qqqFiveH, qqqFiveL] =
+     request.security(benchExt, timeframe.period, f_symbolSessionData(),
+     lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+float qqqAdx  = na
+float qqqRvol = na
+float qqqPdi  = na
+float qqqMdi  = na
+if needAdxRvol
+    [_bAdx, _bRvol, _bPdi, _bMdi] = request.security(benchExt, timeframe.period, f_adxRvol(adxLen, adxSmooth, rvolLen),
+         lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+    qqqAdx  := _bAdx
+    qqqRvol := _bRvol
+    qqqPdi  := _bPdi
+    qqqMdi  := _bMdi
+
+qqqMov       = (na(qqqPdClose) or qqqPdClose == 0 or na(qqqNow)) ? na : (qqqNow / qqqPdClose - 1) * 100
+qqqSinceOpen = (na(qqqOpen) or qqqOpen == 0 or na(qqqNow)) ? na : (qqqNow / qqqOpen - 1) * 100
+qqqPrevD     = (na(qqqPdh) or na(qqqPdl) or na(qqqNow)) ? "—" : f_rangeLabel(qqqNow, qqqPdh, qqqPdl)
+qqqPreMkt    = (na(qqqPmH) or na(qqqPmL) or na(qqqNow)) ? "—" : f_rangeLabel(qqqNow, qqqPmH, qqqPmL)
+
+var float[]  movArr       = array.new<float>()
+var float[]  sinceOpenArr = array.new<float>()
+var string[] prevDArr     = array.new<string>()
+var string[] preMktArr    = array.new<string>()
+var float[]  pdhArr       = array.new<float>()
+var float[]  pdlArr       = array.new<float>()
+var float[]  pmhArr       = array.new<float>()
+var float[]  pmlArr       = array.new<float>()
+var float[]  fiveHArr     = array.new<float>()
+var float[]  fiveLArr     = array.new<float>()
+var float[]  adxArr       = array.new<float>()
+var float[]  rvolArr      = array.new<float>()
+var float[]  pdiArr       = array.new<float>()
+var float[]  mdiArr       = array.new<float>()
+array.clear(movArr)
+array.clear(sinceOpenArr)
+array.clear(prevDArr)
+array.clear(preMktArr)
+array.clear(pdhArr)
+array.clear(pdlArr)
+array.clear(pmhArr)
+array.clear(pmlArr)
+array.clear(fiveHArr)
+array.clear(fiveLArr)
+array.clear(adxArr)
+array.clear(rvolArr)
+array.clear(pdiArr)
+array.clear(mdiArr)
+
+for i = 0 to n - 1
+    s      = array.get(symbolList, i)
+    extSym = ticker.modify(s, session = session.extended)
+    [cNow, sOpen, pdClose, pdh, pdl, pmH, pmL, fiveH, fiveL] = request.security(extSym, timeframe.period, f_symbolSessionData(),
+         lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off, ignore_invalid_symbol = true)
+
+    float symAdx  = na
+    float symRvol = na
+    float symPdi  = na
+    float symMdi  = na
+    if needAdxRvol
+        [_sAdx, _sRvol, _sPdi, _sMdi] = request.security(extSym, timeframe.period, f_adxRvol(adxLen, adxSmooth, rvolLen),
+             lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off, ignore_invalid_symbol = true)
+        symAdx  := _sAdx
+        symRvol := _sRvol
+        symPdi  := _sPdi
+        symMdi  := _sMdi
+
+    symMov       = (na(pdClose) or pdClose == 0 or na(cNow)) ? na : (cNow / pdClose - 1) * 100
+    symSinceOpen = (na(sOpen) or sOpen == 0 or na(cNow)) ? na : (cNow / sOpen - 1) * 100
+
+    prevDLabel  = (na(pdh) or na(pdl) or na(cNow)) ? "—" : f_rangeLabel(cNow, pdh, pdl)
+    preMktLabel = (na(pmH) or na(pmL) or na(cNow)) ? "—" : f_rangeLabel(cNow, pmH, pmL)
+
+    array.push(movArr, symMov)
+    array.push(sinceOpenArr, symSinceOpen)
+    array.push(prevDArr, prevDLabel)
+    array.push(preMktArr, preMktLabel)
+    array.push(pdhArr, pdh)
+    array.push(pdlArr, pdl)
+    array.push(pmhArr, pmH)
+    array.push(pmlArr, pmL)
+    array.push(fiveHArr, fiveH)
+    array.push(fiveLArr, fiveL)
+    array.push(adxArr, symAdx)
+    array.push(rvolArr, symRvol)
+    array.push(pdiArr, symPdi)
+    array.push(mdiArr, symMdi)
+
+// =========================================================================
+// TABLE STYLE
+// =========================================================================
+tblPos = posInput == "Top Right" ? position.top_right :
+         posInput == "Top Left"  ? position.top_left  :
+         posInput == "Bottom Right" ? position.bottom_right : position.bottom_left
+
+tblSize = textSize == "Tiny" ? size.tiny :
+          textSize == "Small" ? size.small :
+          textSize == "Large" ? size.large : size.normal
+
+f_numTextColor(v) =>
+    na(v) ? txtMain : v > 0.05 ? posColor : v < -0.05 ? negColor : txtMain
+
+f_statusColor(label) =>
+    label == "Above" ? color.new(color.green, 0) : label == "Below" ? color.new(color.red, 0) : neutralBg
+
+f_headerCell(tbl, col, label) =>
+    table.cell(tbl, col, 0, label, bgcolor = bgHeader, text_color = txtMain, text_size = tblSize)
+
+f_priceCell(tbl, col, row, val, rowBg) =>
+    table.cell(tbl, col, row, f_fmtPrice(val), bgcolor = rowBg, text_color = txtMain, text_size = tblSize)
+
+f_pctCell(tbl, col, row, val, rowBg) =>
+    table.cell(tbl, col, row, na(val) ? "—" : str.tostring(val, "#.#") + "%", bgcolor = rowBg,
+         text_color = f_numTextColor(val), text_size = tblSize)
+
+f_textCell(tbl, col, row, txt, rowBg, txtCol) =>
+    table.cell(tbl, col, row, txt, bgcolor = rowBg, text_color = txtCol, text_size = tblSize)
+
+f_statusCell(tbl, col, row, label) =>
+    table.cell(tbl, col, row, label, bgcolor = f_statusColor(label), text_color = color.white, text_size = tblSize)
+
+f_adxCell(tbl, col, row, adx, pdi, mdi) =>
+    table.cell(tbl, col, row, f_fmtAdx(adx, pdi, mdi), bgcolor = f_adxBg(adx, pdi, mdi),
+         text_color = color.white, text_size = tblSize)
+
+f_rvolCell(tbl, col, row, v) =>
+    table.cell(tbl, col, row, f_fmtRvol(v), bgcolor = f_rvolBg(v), text_color = color.white, text_size = tblSize)
+
+// =========================================================================
+// TABLE
+// =========================================================================
+bool tableDraw = barstate.islastconfirmedhistory or barstate.islast
+
+if tableDraw and n > 0 and totalCols > 0
+    var table rsTable = na
+    var int[] order = array.new<int>()
+    array.clear(order)
+    for i = 0 to n - 1
+        if not na(array.get(sinceOpenArr, i))
+            array.push(order, i)
+
+    rows = array.size(order)
+    int benchRow  = showBenchRow ? 1 : na
+    int dataStart = showBenchRow ? 2 : 1
+
+    if sortByStrength and rows > 1
+        for i = 0 to rows - 2
+            for j = 0 to rows - 2 - i
+                idxA = array.get(order, j)
+                idxB = array.get(order, j + 1)
+                spreadA = array.get(sinceOpenArr, idxA) - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
+                spreadB = array.get(sinceOpenArr, idxB) - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
+                if spreadB > spreadA
+                    array.set(order, j, idxB)
+                    array.set(order, j + 1, idxA)
+
+    if rows > 0
+        if not na(rsTable)
+            table.delete(rsTable)
+        rsTable := table.new(position = tblPos, columns = totalCols, rows = rows + dataStart,
+             border_width = 1, border_color = color.gray, frame_color = color.gray, frame_width = 1)
+
+        col = 0
+        f_headerCell(rsTable, col, "Sym")
+        col += 1
+        if showMov
+            f_headerCell(rsTable, col, "Mov")
+            col += 1
+        if showOpen
+            f_headerCell(rsTable, col, "Open")
+            col += 1
+        if showBenchCol
+            f_headerCell(rsTable, col, f_shortSymbol(benchmarkSym))
+            col += 1
+        if showRS
+            f_headerCell(rsTable, col, "RS")
+            col += 1
+        if showPrevD
+            f_headerCell(rsTable, col, "PrevD")
+            col += 1
+        if showPreMkt
+            f_headerCell(rsTable, col, "PreMkt")
+            col += 1
+        if showTrend
+            f_headerCell(rsTable, col, "Trend")
+            col += 1
+        if showYTrend
+            f_headerCell(rsTable, col, "YTrend")
+            col += 1
+        if showADX
+            f_headerCell(rsTable, col, "ADX")
+            col += 1
+        if showRVOL
+            f_headerCell(rsTable, col, "RVOL")
+            col += 1
+        if showPDH
+            f_headerCell(rsTable, col, "PDH")
+            col += 1
+        if showPDL
+            f_headerCell(rsTable, col, "PDL")
+            col += 1
+        if showPMH
+            f_headerCell(rsTable, col, "PMH")
+            col += 1
+        if showPML
+            f_headerCell(rsTable, col, "PML")
+            col += 1
+        if show5mH
+            f_headerCell(rsTable, col, "5mH")
+            col += 1
+        if show5mL
+            f_headerCell(rsTable, col, "5mL")
+
+        if showBenchRow
+            col := 0
+            f_textCell(rsTable, col, benchRow, f_shortSymbol(benchmarkSym), bgBenchRow, txtMain)
+            col += 1
+            if showMov
+                f_pctCell(rsTable, col, benchRow, qqqMov, bgBenchRow)
+                col += 1
+            if showOpen
+                f_pctCell(rsTable, col, benchRow, qqqSinceOpen, bgBenchRow)
+                col += 1
+            if showBenchCol
+                f_pctCell(rsTable, col, benchRow, qqqSinceOpen, bgBenchRow)
+                col += 1
+            if showRS
+                f_textCell(rsTable, col, benchRow, "—", bgBenchRow, txtMain)
+                col += 1
+            if showPrevD
+                f_statusCell(rsTable, col, benchRow, qqqPrevD)
+                col += 1
+            if showPreMkt
+                f_statusCell(rsTable, col, benchRow, qqqPreMkt)
+                col += 1
+            if showTrend
+                f_textCell(rsTable, col, benchRow, "—", bgBenchRow, txtMain)
+                col += 1
+            if showYTrend
+                f_statusCell(rsTable, col, benchRow, benchYTrend)
+                col += 1
+            if showADX
+                f_adxCell(rsTable, col, benchRow, qqqAdx, qqqPdi, qqqMdi)
+                col += 1
+            if showRVOL
+                f_rvolCell(rsTable, col, benchRow, qqqRvol)
+                col += 1
+            if showPDH
+                f_priceCell(rsTable, col, benchRow, qqqPdh, bgBenchRow)
+                col += 1
+            if showPDL
+                f_priceCell(rsTable, col, benchRow, qqqPdl, bgBenchRow)
+                col += 1
+            if showPMH
+                f_priceCell(rsTable, col, benchRow, qqqPmH, bgBenchRow)
+                col += 1
+            if showPML
+                f_priceCell(rsTable, col, benchRow, qqqPmL, bgBenchRow)
+                col += 1
+            if show5mH
+                f_priceCell(rsTable, col, benchRow, qqqFiveH, bgBenchRow)
+                col += 1
+            if show5mL
+                f_priceCell(rsTable, col, benchRow, qqqFiveL, bgBenchRow)
+
+        for k = 0 to rows - 1
+            row = k + dataStart
+            idx = array.get(order, k)
+            s        = array.get(symbolList, idx)
+            movRet   = array.get(movArr, idx)
+            sOpenRet = array.get(sinceOpenArr, idx)
+            prevD    = array.get(prevDArr, idx)
+            preMkt   = array.get(preMktArr, idx)
+            pdhVal   = array.get(pdhArr, idx)
+            pdlVal   = array.get(pdlArr, idx)
+            pmhVal   = array.get(pmhArr, idx)
+            pmlVal   = array.get(pmlArr, idx)
+            fiveHVal = array.get(fiveHArr, idx)
+            fiveLVal = array.get(fiveLArr, idx)
+            adxVal   = array.get(adxArr, idx)
+            rvolVal  = array.get(rvolArr, idx)
+            pdiVal   = array.get(pdiArr, idx)
+            mdiVal   = array.get(mdiArr, idx)
+            yTrendVal = needYTrend and idx < array.size(yTrendArr) ? array.get(yTrendArr, idx) : "—"
+
+            spread = sOpenRet - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
+            rsSym   = spread > 0.05 ? "▲" : spread < -0.05 ? "▼" : "•"
+            rsColor = spread > 0.05 ? color.new(color.green, 0) : spread < -0.05 ? color.new(color.red, 0) : neutralBg
+
+            bullAlign = prevD == "Above" and preMkt == "Above" and rsSym == "▲"
+            bearAlign = prevD == "Below" and preMkt == "Below" and rsSym == "▼"
+            trendSym   = bullAlign ? "▲" : bearAlign ? "▼" : "•"
+            trendColor = bullAlign ? color.new(color.green, 0) : bearAlign ? color.new(color.red, 0) : neutralBg
+
+            col := 0
+            f_textCell(rsTable, col, row, f_shortSymbol(s), bgMain, txtMain)
+            col += 1
+            if showMov
+                f_pctCell(rsTable, col, row, movRet, bgMain)
+                col += 1
+            if showOpen
+                f_pctCell(rsTable, col, row, sOpenRet, bgMain)
+                col += 1
+            if showBenchCol
+                f_pctCell(rsTable, col, row, qqqSinceOpen, bgMain)
+                col += 1
+            if showRS
+                table.cell(rsTable, col, row, rsSym, bgcolor = rsColor, text_color = color.white, text_size = tblSize)
+                col += 1
+            if showPrevD
+                f_statusCell(rsTable, col, row, prevD)
+                col += 1
+            if showPreMkt
+                f_statusCell(rsTable, col, row, preMkt)
+                col += 1
+            if showTrend
+                table.cell(rsTable, col, row, trendSym, bgcolor = trendColor, text_color = color.white, text_size = tblSize)
+                col += 1
+            if showYTrend
+                f_statusCell(rsTable, col, row, yTrendVal)
+                col += 1
+            if showADX
+                f_adxCell(rsTable, col, row, adxVal, pdiVal, mdiVal)
+                col += 1
+            if showRVOL
+                f_rvolCell(rsTable, col, row, rvolVal)
+                col += 1
+            if showPDH
+                f_priceCell(rsTable, col, row, pdhVal, bgMain)
+                col += 1
+            if showPDL
+                f_priceCell(rsTable, col, row, pdlVal, bgMain)
+                col += 1
+            if showPMH
+                f_priceCell(rsTable, col, row, pmhVal, bgMain)
+                col += 1
+            if showPML
+                f_priceCell(rsTable, col, row, pmlVal, bgMain)
+                col += 1
+            if show5mH
+                f_priceCell(rsTable, col, row, fiveHVal, bgMain)
+                col += 1
+            if show5mL
+                f_priceCell(rsTable, col, row, fiveLVal, bgMain)
