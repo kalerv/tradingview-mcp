@@ -1,0 +1,459 @@
+//@version=6
+// Break and Bounce — Pine Script v6 strategy
+// Spec: strategies/breakandretest/docs/break_and_bounce_spec.md
+// v1 — phases 1–4 + visualization (levels, retest SM, volume quadrant, SL/TP/entry)
+
+string GRP_LEVELS = "§2 Key Levels"
+string GRP_BREAK  = "§3 Breakout (5m chart)"
+string GRP_RETEST = "§4 Retest Window"
+string GRP_VOL    = "§5 Volume — PENDING CALIBRATION (§5.3 sweep ranges)"
+string GRP_RISK   = "§7–9 Risk Management"
+string GRP_VIS    = "Visualization"
+string GRP_SIZE   = "Position Sizing"
+
+strategy(
+     title                   = "Break and Bounce",
+     shorttitle              = "BnB",
+     overlay                 = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 100000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.84,
+     slippage                = 1,
+     calc_on_every_tick      = false,
+     process_orders_on_close = true)
+
+// §4.3 — LOCKED session window
+sessionWindow = input.session("0930-1130", "Session Window (ET)", group = GRP_RETEST)
+tz            = input.string("America/New_York", "Session Timezone", group = GRP_RETEST)
+
+// §3 — body % LOCKED at 50%; ATR multiplier LOCKED at 1.0x (§11)
+bodyPctMin = input.float(50.0, "Body % Minimum", minval = 40, maxval = 70, step = 1, group = GRP_BREAK,
+     tooltip = "§3 LOCKED at 50% per spec §11")
+atrLen     = input.int(14, "ATR Length", minval = 5, maxval = 50, group = GRP_BREAK)
+atrMult    = input.float(1.0, "ATR Displacement Multiplier", minval = 0.5, maxval = 3.0, step = 0.1, group = GRP_BREAK,
+     tooltip = "§3 LOCKED at 1.0x per spec §11")
+displacementMode = input.string("Candle Range", "Displacement Mode", options = ["Distance from Level", "Candle Range"], group = GRP_BREAK,
+     tooltip = "§3 Mode A vs B — sweep both per spec")
+
+// §4.1 — retest timeframe + auto-mapped timeout (LOCKED mapping)
+retestTF = input.string("1", "Retest Timeframe", options = ["1", "3", "5"], group = GRP_RETEST,
+     tooltip = "§4.1 — 1→7 bars, 3→3 bars, 5→2 bars")
+
+// §5.3 — PENDING CALIBRATION (defaults = midpoints of sweep ranges, not final)
+todLookbackBars     = input.int(20, "RVOL Lookback (bars)", minval = 10, maxval = 60, group = GRP_VOL,
+     tooltip = "§5.3 PENDING — v1 uses rolling SMA, not true time-of-day buckets")
+breakoutRVOLmin     = input.float(1.6, "Breakout RVOL Min", minval = 1.3, maxval = 3.0, step = 0.1, group = GRP_VOL)
+pokeRVOLmax         = input.float(0.7, "Poke RVOL Max (low-volume)", minval = 0.5, maxval = 0.9, step = 0.05, group = GRP_VOL)
+reclaimRVOLmin      = input.float(1.5, "Reclaim RVOL Min (standard)", minval = 1.2, maxval = 2.0, step = 0.1, group = GRP_VOL)
+reclaimRVOLoverride = input.float(2.5, "Reclaim RVOL Min (override, high-vol poke)", minval = 2.0, maxval = 3.5, step = 0.1, group = GRP_VOL)
+pullbackFraction    = input.float(0.7, "Pullback Vol ≤ Breakout Vol ×", minval = 0.6, maxval = 0.8, step = 0.05, group = GRP_VOL)
+reclaimMultiplier   = input.float(2.0, "Reclaim Vol ≥ Pullback Avg ×", minval = 1.5, maxval = 2.5, step = 0.1, group = GRP_VOL)
+
+// §7 — LOCKED structural SL via pivots
+pivotLeft  = input.int(3, "Pivot Left", minval = 1, maxval = 10, group = GRP_RISK)
+pivotRight = input.int(3, "Pivot Right", minval = 1, maxval = 10, group = GRP_RISK)
+
+// §8 — circuit breaker % OPEN (empirical)
+circuitBreakerPct = input.float(1.5, "Circuit Breaker %", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK,
+     tooltip = "§8 OPEN — intrabar hard stop beyond structural SL")
+
+// §9 — LOCKED at 2R for v1
+tpRMultiple = input.float(2.0, "TP R-Multiple", minval = 1.0, maxval = 5.0, step = 0.5, group = GRP_RISK,
+     tooltip = "§9 LOCKED at 2R for v1")
+
+// Note: Pine strategy() commission/qty/slippage are set in declaration (0.84 / 1 tick / 1 contract).
+// Adjust literals in strategy() call above if you change these reference inputs:
+commissionCash = input.float(0.84, "Commission ref ($/contract)", minval = 0, step = 0.01, group = GRP_RISK,
+     tooltip = "Mirror of strategy() commission_value — change both together")
+slippageTicks  = input.int(1, "Slippage ref (ticks)", minval = 0, maxval = 10, group = GRP_RISK,
+     tooltip = "Mirror of strategy() slippage — change both together")
+qtyContracts   = input.int(1, "Contracts ref", minval = 1, maxval = 100, group = GRP_SIZE,
+     tooltip = "Mirror of strategy() default_qty_value — change both together")
+
+showDebugTable = input.bool(true, "Show Debug Table", group = GRP_VIS)
+showRetestBox  = input.bool(true, "Show Retest Window Box", group = GRP_VIS)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2 — KEY LEVELS (PDH / PDL)
+// Previous session high/low via daily series; [1] + lookahead_off avoids repaint.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+plot(pdh, "PDH", color = color.new(color.teal, 0), linewidth = 2, style = plot.style_linebr)
+plot(pdl, "PDL", color = color.new(color.orange, 0), linewidth = 2, style = plot.style_linebr)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4.3 — SESSION FILTER (timezone-aware, not hardcoded UTC)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+inSession      = not na(time(timeframe.period, sessionWindow, tz))
+isFiveMinChart = timeframe.in_seconds(timeframe.period) == 300
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3 — BREAKOUT DEFINITION (5m chart)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atr5    = ta.atr(atrLen)
+rng     = high - low
+bodyPct = rng > 0 ? math.abs(close - open) / rng : 0.0
+
+displacementOk(float level) =>
+    displacementMode == "Distance from Level" ? math.abs(close - level) >= atrMult * atr5 : rng >= atrMult * atr5
+
+// §5.2 external RVOL — v1 approximation: volume / SMA(volume, N)
+// TODO §5.3 stretch goal: true time-of-day bucket matching across trading days
+avgVol = ta.sma(volume, todLookbackBars)
+rvolBar(float v) =>
+    not na(avgVol) and avgVol > 0 ? v / avgVol : na
+
+breakoutRvol = rvolBar(volume)
+
+breakLongRaw  = isFiveMinChart and inSession and close > pdh and bodyPct >= bodyPctMin / 100.0 and displacementOk(pdh)
+breakShortRaw = isFiveMinChart and inSession and close < pdl and bodyPct >= bodyPctMin / 100.0 and displacementOk(pdl)
+
+breakLong  = breakLongRaw  and not na(breakoutRvol) and breakoutRvol >= breakoutRVOLmin
+breakShort = breakShortRaw and not na(breakoutRvol) and breakoutRvol >= breakoutRVOLmin
+
+bgcolor(breakLong ? color.new(color.green, 88) : breakShort ? color.new(color.red, 88) : na, title = "§3 Breakout Highlight")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §7 — STRUCTURAL SWING POINTS (pivot-based SL anchor)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+
+var float trackedSwingLowClose  = na
+var float trackedSwingHighClose = na
+
+if not na(pl)
+    trackedSwingLowClose := close[pivotRight]
+if not na(ph)
+    trackedSwingHighClose := close[pivotRight]
+
+// §4.1 — RETEST TIMEOUT MAP (LOCKED): "1"→7 | "3"→3 | "5"→2
+timeoutBars = retestTF == "1" ? 7 : retestTF == "3" ? 3 : 2
+
+chartTfSec   = timeframe.in_seconds(timeframe.period)
+retestTfSec  = timeframe.in_seconds(retestTF)
+useLtfArrays = retestTfSec < chartTfSec
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STATE MACHINE — §4 + §6
+// IDLE → BREAKOUT_CONFIRMED → AWAITING_RETEST → RESOLVED_* → IN_TRADE → CLOSED
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var string STATE_IDLE          = "IDLE"
+var string STATE_BREAKOUT      = "BREAKOUT_CONFIRMED"
+var string STATE_AWAITING      = "AWAITING_RETEST"
+var string STATE_RESOLVED_PASS = "RESOLVED_PASS"
+var string STATE_RESOLVED_FAIL = "RESOLVED_FAIL"
+var string STATE_IN_TRADE      = "IN_TRADE"
+var string STATE_CLOSED        = "CLOSED"
+
+var string state           = STATE_IDLE
+var int    breakDir        = 0
+var float  breakLevel      = na
+var float  breakVolume     = na
+var float  breakRvol       = na
+var int    breakBarIndex   = na
+var float  structSL        = na
+var int    retestBarsSeen  = 0
+var bool   pokeStarted     = false
+var float  pokeVolSum      = 0.0
+var int    pokeBarCount    = 0
+var float  pokeRvolVal     = na
+var bool   firstRetestDone = false
+var box    retestBox       = na
+
+var float  dbgBreakRvol    = na
+var float  dbgPokeRvol     = na
+var float  dbgReclaimRvol  = na
+var float  dbgRMultiple    = na
+var string dbgOutcome      = ""
+
+// §5 — volume quadrant (pure helpers — no global mutation)
+f_quadrant(bool isLowPoke, bool reclaimed, float reclaimRvol) =>
+    bool pass = false
+    if isLowPoke
+        pass := reclaimed and not na(reclaimRvol) and reclaimRvol >= reclaimRVOLmin
+    else if not reclaimed
+        pass := false
+    else
+        pass := not na(reclaimRvol) and reclaimRvol >= reclaimRVOLoverride
+    pass
+
+f_internalOk(float bkVol, float pokeAvgVol, float reclaimVol) =>
+    pokeAvgVol <= bkVol * pullbackFraction and reclaimVol >= pokeAvgVol * reclaimMultiplier
+
+f_tradeDir(int originalBreakDir, bool pass) =>
+    pass ? originalBreakDir : -originalBreakDir
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MAIN BAR LOGIC — confirmed 5m closes only
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool doReset     = false
+string resetMsg  = ""
+
+if barstate.isconfirmed and isFiveMinChart
+
+    // §3 + §4 — fresh breakout from IDLE
+    if state == STATE_IDLE and inSession
+        if breakLong
+            breakDir       := 1
+            breakLevel     := pdh
+            breakVolume    := volume
+            breakRvol      := breakoutRvol
+            breakBarIndex  := bar_index
+            structSL       := trackedSwingLowClose
+            dbgBreakRvol   := breakoutRvol
+            state          := STATE_AWAITING
+            retestBarsSeen := 0
+            pokeStarted    := false
+            firstRetestDone := false
+            dbgPokeRvol    := na
+            dbgReclaimRvol := na
+            dbgOutcome     := ""
+            log.info(str.format("§3 BREAKOUT_CONFIRMED LONG | {0,time,HH:mm} PDH={1} RVOL={2} SL={3}", time, pdh, breakoutRvol, structSL))
+            log.info(str.format("§4 AWAITING_RETEST | timeout={0} @{1}m", timeoutBars, retestTF))
+            if showRetestBox
+                if not na(retestBox)
+                    box.delete(retestBox)
+                float pad = atr5 * 0.15
+                retestBox := box.new(breakBarIndex, breakLevel + pad, bar_index + 3, breakLevel - pad,
+                     border_color = color.new(color.blue, 40), bgcolor = color.new(color.blue, 92))
+
+        else if breakShort
+            breakDir       := -1
+            breakLevel     := pdl
+            breakVolume    := volume
+            breakRvol      := breakoutRvol
+            breakBarIndex  := bar_index
+            structSL       := trackedSwingHighClose
+            dbgBreakRvol   := breakoutRvol
+            state          := STATE_AWAITING
+            retestBarsSeen := 0
+            pokeStarted    := false
+            firstRetestDone := false
+            dbgPokeRvol    := na
+            dbgReclaimRvol := na
+            dbgOutcome     := ""
+            log.info(str.format("§3 BREAKOUT_CONFIRMED SHORT | {0,time,HH:mm} PDL={1} RVOL={2} SL={3}", time, pdl, breakoutRvol, structSL))
+            log.info(str.format("§4 AWAITING_RETEST | timeout={0} @{1}m", timeoutBars, retestTF))
+            if showRetestBox
+                if not na(retestBox)
+                    box.delete(retestBox)
+                float pad = atr5 * 0.15
+                retestBox := box.new(breakBarIndex, breakLevel + pad, bar_index + 3, breakLevel - pad,
+                     border_color = color.new(color.blue, 40), bgcolor = color.new(color.blue, 92))
+
+    // §4 + §5 — retest processing via request.security_lower_tf (or chart bar if retest TF = 5m)
+    if state == STATE_AWAITING and inSession and not firstRetestDone
+        if useLtfArrays
+            [ltfH, ltfL, ltfC, ltfV] = request.security_lower_tf(syminfo.tickerid, retestTF, [high, low, close, volume])
+            int n = array.size(ltfC)
+            if n > 0
+                for i = 0 to n - 1
+                    if state == STATE_AWAITING and not firstRetestDone and not doReset
+                        retestBarsSeen += 1
+                        float bH = array.get(ltfH, i)
+                        float bL = array.get(ltfL, i)
+                        float bC = array.get(ltfC, i)
+                        float bV = array.get(ltfV, i)
+                        float barRvol = rvolBar(bV)
+                        bool isLongBreak = breakDir == 1
+                        bool poked = isLongBreak ? bL <= breakLevel : bH >= breakLevel
+                        bool reclaimed = isLongBreak ? bC > breakLevel : bC < breakLevel
+                        bool timedOut = retestBarsSeen > timeoutBars
+                        if timedOut
+                            doReset  := true
+                            resetMsg := "§4.1 retest timeout"
+                        else if not pokeStarted and poked
+                            pokeStarted  := true
+                            pokeVolSum   := bV
+                            pokeBarCount := 1
+                            pokeRvolVal  := barRvol
+                            dbgPokeRvol  := barRvol
+                            log.info(str.format("§4.2 first poke | {0,time,HH:mm} level={1} pokeRVOL={2}", time, breakLevel, barRvol))
+                        else if pokeStarted
+                            if poked
+                                pokeVolSum   += bV
+                                pokeBarCount += 1
+                            if reclaimed
+                                float pokeAvg = pokeBarCount > 0 ? pokeVolSum / pokeBarCount : bV
+                                dbgReclaimRvol := barRvol
+                                bool isLowPoke = not na(pokeRvolVal) and pokeRvolVal <= pokeRVOLmax
+                                bool quadPass  = f_quadrant(isLowPoke, true, barRvol)
+                                bool internal  = f_internalOk(breakVolume, pokeAvg, bV)
+                                bool pass      = quadPass and internal
+                                firstRetestDone := true
+                                state := pass ? STATE_RESOLVED_PASS : STATE_RESOLVED_FAIL
+                                dbgOutcome := pass ? "PASS" : "FAIL"
+                                log.info(str.format("§5 {0} | {1,time,HH:mm} lowPoke={2} reclaimRVOL={3} internal={4}", dbgOutcome, time, isLowPoke, barRvol, internal))
+                            else if retestBarsSeen >= timeoutBars
+                                firstRetestDone := true
+                                state := STATE_RESOLVED_FAIL
+                                dbgOutcome := "FAIL (no reclaim)"
+                                log.info(str.format("§5 FAIL no reclaim | {0,time,HH:mm}", time))
+        else
+            retestBarsSeen += 1
+            float barRvol = rvolBar(volume)
+            bool isLongBreak = breakDir == 1
+            bool poked = isLongBreak ? low <= breakLevel : high >= breakLevel
+            bool reclaimed = isLongBreak ? close > breakLevel : close < breakLevel
+            bool timedOut = retestBarsSeen > timeoutBars
+            if timedOut
+                doReset  := true
+                resetMsg := "§4.1 retest timeout"
+            else if not pokeStarted and poked
+                pokeStarted  := true
+                pokeVolSum   := volume
+                pokeBarCount := 1
+                pokeRvolVal  := barRvol
+                dbgPokeRvol  := barRvol
+                log.info(str.format("§4.2 first poke | {0,time,HH:mm} level={1} pokeRVOL={2}", time, breakLevel, barRvol))
+            else if pokeStarted
+                if poked
+                    pokeVolSum   += volume
+                    pokeBarCount += 1
+                if reclaimed
+                    float pokeAvg = pokeBarCount > 0 ? pokeVolSum / pokeBarCount : volume
+                    dbgReclaimRvol := barRvol
+                    bool isLowPoke = not na(pokeRvolVal) and pokeRvolVal <= pokeRVOLmax
+                    bool quadPass  = f_quadrant(isLowPoke, true, barRvol)
+                    bool internal  = f_internalOk(breakVolume, pokeAvg, volume)
+                    bool pass      = quadPass and internal
+                    firstRetestDone := true
+                    state := pass ? STATE_RESOLVED_PASS : STATE_RESOLVED_FAIL
+                    dbgOutcome := pass ? "PASS" : "FAIL"
+                    log.info(str.format("§5 {0} | {1,time,HH:mm} lowPoke={2} reclaimRVOL={3} internal={4}", dbgOutcome, time, isLowPoke, barRvol, internal))
+                else if retestBarsSeen >= timeoutBars
+                    firstRetestDone := true
+                    state := STATE_RESOLVED_FAIL
+                    dbgOutcome := "FAIL (no reclaim)"
+                    log.info(str.format("§5 FAIL no reclaim | {0,time,HH:mm}", time))
+
+        if not na(retestBox)
+            box.set_right(retestBox, bar_index + 1)
+
+    // §4.3 — session ended while awaiting
+    if state == STATE_AWAITING and not inSession
+        doReset  := true
+        resetMsg := "§4.3 session window closed"
+
+    // §4.2 — no poke before timeout
+    if state == STATE_AWAITING and retestBarsSeen >= timeoutBars and not pokeStarted and not firstRetestDone
+        doReset  := true
+        resetMsg := "§4.2 no poke within timeout"
+
+    // §6 + §7–9 — entry after resolution
+    if (state == STATE_RESOLVED_PASS or state == STATE_RESOLVED_FAIL) and inSession and strategy.position_size == 0
+        bool pass = state == STATE_RESOLVED_PASS
+        int tDir  = f_tradeDir(breakDir, pass)
+        string entryId = tDir == 1 ? "Long" : "Short"
+        float entryPrice = close
+        float slPrice = structSL
+
+        if na(slPrice)
+            doReset  := true
+            resetMsg := "§7 missing structural SL"
+        else
+            float risk = tDir == 1 ? entryPrice - slPrice : slPrice - entryPrice
+            if risk <= 0
+                doReset  := true
+                resetMsg := "§7 invalid risk distance"
+            else
+                float tpPrice = tDir == 1 ? entryPrice + tpRMultiple * risk : entryPrice - tpRMultiple * risk
+                float cbPrice = tDir == 1 ? entryPrice * (1.0 - circuitBreakerPct / 100.0) : entryPrice * (1.0 + circuitBreakerPct / 100.0)
+                bool cbValid = tDir == 1 ? cbPrice < slPrice : cbPrice > slPrice
+                if not cbValid
+                    cbPrice := tDir == 1 ? slPrice - syminfo.mintick * 10 : slPrice + syminfo.mintick * 10
+
+                strategy.entry(entryId, tDir == 1 ? strategy.long : strategy.short)
+                // §8 intrabar circuit breaker + §9 TP limit — structural SL handled separately on close
+                strategy.exit(entryId + " Exit", entryId, stop = cbPrice, limit = tpPrice)
+                state := STATE_IN_TRADE
+                dbgRMultiple := 0.0
+                log.info(str.format("§6–9 IN_TRADE {0} | {1,time,HH:mm} pass={2} entry={3} SL={4} TP={5} CB={6}", entryId, time, pass, entryPrice, slPrice, tpPrice, cbPrice))
+
+                line.new(bar_index, entryPrice, bar_index + 20, entryPrice, color = color.new(color.green, 0), width = 2)
+                line.new(bar_index, slPrice,    bar_index + 20, slPrice,    color = color.new(color.red, 0), width = 2, style = line.style_dashed)
+                line.new(bar_index, cbPrice,    bar_index + 20, cbPrice,    color = color.new(color.red, 50), width = 1, style = line.style_dotted)
+                line.new(bar_index, tpPrice,    bar_index + 20, tpPrice,    color = color.new(color.green, 40), width = 2)
+
+    // §7 — structural SL: close-confirmed (NOT strategy.exit stop=)
+    if state == STATE_IN_TRADE and strategy.position_size != 0 and not na(structSL)
+        if strategy.position_size > 0 and close < structSL
+            strategy.close("Long", comment = "§7 Struct SL close")
+            state := STATE_CLOSED
+            log.info(str.format("§7 CLOSED struct SL long | {0,time,HH:mm} close={1}", time, close))
+        if strategy.position_size < 0 and close > structSL
+            strategy.close("Short", comment = "§7 Struct SL close")
+            state := STATE_CLOSED
+            log.info(str.format("§7 CLOSED struct SL short | {0,time,HH:mm} close={1}", time, close))
+
+    if state == STATE_IN_TRADE and strategy.position_size != 0 and not na(structSL)
+        float ep = strategy.position_avg_price
+        float rk = strategy.position_size > 0 ? ep - structSL : structSL - ep
+        if rk > 0
+            dbgRMultiple := strategy.position_size > 0 ? (close - ep) / rk : (ep - close) / rk
+
+    if state == STATE_IN_TRADE and strategy.position_size == 0
+        state := STATE_CLOSED
+        log.info(str.format("CLOSED flat | {0,time,HH:mm}", time))
+
+    if state == STATE_CLOSED
+        doReset  := true
+        resetMsg := "ready for next setup"
+
+// Reset block (cannot live inside a function — Pine restriction)
+if doReset
+    log.info(str.format("RESET → IDLE | {0,time,HH:mm} reason={1}", time, resetMsg))
+    state           := STATE_IDLE
+    breakDir        := 0
+    breakLevel      := na
+    breakVolume     := na
+    breakRvol       := na
+    breakBarIndex   := na
+    structSL        := na
+    retestBarsSeen  := 0
+    pokeStarted     := false
+    pokeVolSum      := 0.0
+    pokeBarCount    := 0
+    pokeRvolVal     := na
+    firstRetestDone := false
+    dbgPokeRvol     := na
+    dbgReclaimRvol  := na
+    dbgOutcome      := ""
+    if not na(retestBox)
+        box.delete(retestBox)
+        retestBox := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VISUALIZATION — debug table (top-right)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table dbgTable = na
+if showDebugTable and barstate.islast
+    if na(dbgTable)
+        dbgTable := table.new(position.top_right, 2, 7, border_width = 1)
+    table.cell(dbgTable, 0, 0, "State", text_color = color.white, bgcolor = color.new(color.gray, 30))
+    table.cell(dbgTable, 1, 0, state, text_color = color.white, bgcolor = color.new(color.gray, 60))
+    table.cell(dbgTable, 0, 1, "Break RVOL", bgcolor = color.new(color.gray, 80))
+    table.cell(dbgTable, 1, 1, na(dbgBreakRvol) ? "—" : str.tostring(dbgBreakRvol, "#.##"), bgcolor = color.new(color.gray, 90))
+    table.cell(dbgTable, 0, 2, "Poke RVOL", bgcolor = color.new(color.gray, 80))
+    table.cell(dbgTable, 1, 2, na(dbgPokeRvol) ? "—" : str.tostring(dbgPokeRvol, "#.##"), bgcolor = color.new(color.gray, 90))
+    table.cell(dbgTable, 0, 3, "Reclaim RVOL", bgcolor = color.new(color.gray, 80))
+    table.cell(dbgTable, 1, 3, na(dbgReclaimRvol) ? "—" : str.tostring(dbgReclaimRvol, "#.##"), bgcolor = color.new(color.gray, 90))
+    table.cell(dbgTable, 0, 4, "R-multiple", bgcolor = color.new(color.gray, 80))
+    table.cell(dbgTable, 1, 4, na(dbgRMultiple) ? "—" : str.tostring(dbgRMultiple, "#.##"), bgcolor = color.new(color.gray, 90))
+    table.cell(dbgTable, 0, 5, "Outcome", bgcolor = color.new(color.gray, 80))
+    table.cell(dbgTable, 1, 5, dbgOutcome == "" ? "—" : dbgOutcome, bgcolor = color.new(color.gray, 90))
+    table.cell(dbgTable, 0, 6, "Chart TF", bgcolor = color.new(color.gray, 80))
+    table.cell(dbgTable, 1, 6, isFiveMinChart ? "5m OK" : "NEED 5m", bgcolor = isFiveMinChart ? color.new(color.green, 70) : color.new(color.red, 60))

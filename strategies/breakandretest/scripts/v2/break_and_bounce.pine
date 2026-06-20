@@ -1,0 +1,724 @@
+//@version=6
+// Break and Bounce v2 — Pine Script v6 strategy
+// Spec: break_and_bounce_spec_v2.md (§2 level pool, §3 multi-level, §4–6 engine, §8–10 modes, §11 TFs)
+// Breakout / retest / volume-quadrant internals preserved — generalized to active level parameter.
+
+string GRP_LEVELS = "§2 Level Pool"
+string GRP_SEQ    = "§3 Multi-Level Sequencing"
+string GRP_TF     = "§11 Timeframes"
+string GRP_BREAK  = "§4 Breakout"
+string GRP_RETEST = "§4 Retest Window"
+string GRP_VOL    = "§5 Volume — PENDING CALIBRATION"
+string GRP_ENTRY  = "§8 Entry Mode"
+string GRP_SL     = "§9 Stop Loss Mode"
+string GRP_TP     = "§10 Take Profit Mode"
+string GRP_RISK   = "Risk / Circuit Breaker"
+string GRP_VIS    = "§7 Debug Table"
+string GRP_SIZE   = "Position Sizing"
+
+strategy(
+     title                   = "Break and Bounce v2",
+     shorttitle              = "BnB v2",
+     overlay                 = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1,
+     initial_capital         = 100000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.84,
+     slippage                = 1,
+     calc_on_every_tick      = true,
+     process_orders_on_close = true)
+
+// ── §2 — independent level toggles (not paired) ─────────────────────────────
+usePDH = input.bool(true,  "Enable PDH (long break)",  group = GRP_LEVELS)
+usePDL = input.bool(true,  "Enable PDL (short break)", group = GRP_LEVELS)
+usePMH = input.bool(false, "Enable PMH (long break)",  group = GRP_LEVELS, tooltip = "§2 stocks/ETFs only")
+usePML = input.bool(false, "Enable PML (short break)", group = GRP_LEVELS, tooltip = "§2 stocks/ETFs only")
+use5MH = input.bool(false, "Enable 5MH (long break)",  group = GRP_LEVELS)
+use5ML = input.bool(false, "Enable 5ML (short break)", group = GRP_LEVELS)
+
+// ── §11 — three global timeframes ───────────────────────────────────────────
+breakoutTF = input.string("5", "Breakout Timeframe", options = ["1", "3", "5", "15", "30", "60"], group = GRP_TF)
+retestTF   = input.string("1", "Retest Timeframe", options = ["1", "3", "5"], group = GRP_TF,
+     tooltip = "§4.1 timeout map: 1→7, 3→3, 5→2 bars")
+useRetestAsEntry = input.bool(true, "Entry TF = Retest TF (§11 default)", group = GRP_TF)
+entryTF          = input.string("1", "Entry Timeframe (when not same as Retest)", options = ["1", "3", "5", "15"], group = GRP_TF)
+
+effectiveEntryTF = useRetestAsEntry ? retestTF : entryTF
+
+// ── §4.3 session ────────────────────────────────────────────────────────────
+sessionWindow = input.session("0930-1130", "Session Window (ET)", group = GRP_RETEST)
+tz            = input.string("America/New_York", "Session Timezone", group = GRP_RETEST)
+
+// ── §4 breakout params (LOCKED body/ATR per spec) ───────────────────────────
+bodyPctMin = input.float(50.0, "Body % Minimum", minval = 40, maxval = 70, step = 1, group = GRP_BREAK)
+atrLen     = input.int(14, "ATR Length", minval = 5, maxval = 50, group = GRP_BREAK)
+atrMult    = input.float(1.0, "ATR Displacement Multiplier", minval = 0.5, maxval = 3.0, step = 0.1, group = GRP_BREAK)
+displacementMode = input.string("Candle Range", "Displacement Mode", options = ["Distance from Level", "Candle Range"], group = GRP_BREAK)
+
+// ── §5 volume (PENDING CALIBRATION §5.3) ────────────────────────────────────
+todLookbackBars     = input.int(20, "RVOL Lookback (bars)", minval = 10, maxval = 60, group = GRP_VOL)
+breakoutRVOLmin     = input.float(1.6, "Breakout RVOL Min", minval = 1.3, maxval = 3.0, step = 0.1, group = GRP_VOL)
+pokeRVOLmax         = input.float(0.7, "Poke RVOL Max", minval = 0.5, maxval = 0.9, step = 0.05, group = GRP_VOL)
+reclaimRVOLmin      = input.float(1.5, "Reclaim RVOL Min (standard)", minval = 1.2, maxval = 2.0, step = 0.1, group = GRP_VOL)
+reclaimRVOLoverride = input.float(2.5, "Reclaim RVOL Override", minval = 2.0, maxval = 3.5, step = 0.1, group = GRP_VOL)
+pullbackFraction    = input.float(0.7, "Pullback Vol ≤ Breakout Vol ×", minval = 0.6, maxval = 0.8, step = 0.05, group = GRP_VOL)
+reclaimMultiplier   = input.float(2.0, "Reclaim Vol ≥ Pullback Avg ×", minval = 1.5, maxval = 2.5, step = 0.1, group = GRP_VOL)
+
+// ── §8 entry mode ───────────────────────────────────────────────────────────
+entryMode = input.string("Immediate", "Entry Mode", options = ["Immediate", "Confirmation"], group = GRP_ENTRY)
+
+// ── §9 SL mode ────────────────────────────────────────────────────────────────
+slMode = input.string("Structural Swing Point", "SL Mode", options = ["Structural Swing Point", "Retest Candle Extreme"], group = GRP_SL)
+pivotLeft  = input.int(3, "Pivot Left (Structural)", minval = 1, maxval = 10, group = GRP_SL)
+pivotRight = input.int(3, "Pivot Right (Structural)", minval = 1, maxval = 10, group = GRP_SL)
+
+// ── §10 TP mode ───────────────────────────────────────────────────────────────
+tpMode      = input.string("Fixed 2R", "TP Mode", options = ["Fixed 2R", "Ceiling Ladder"], group = GRP_TP)
+tpRMultiple = input.float(2.0, "Fixed 2R Multiple", minval = 1.0, maxval = 5.0, step = 0.5, group = GRP_TP)
+tier1Pct    = input.float(60.0, "Ladder Tier 1 %", minval = 1, maxval = 98, group = GRP_TP)
+tier2Pct    = input.float(30.0, "Ladder Tier 2 %", minval = 1, maxval = 98, group = GRP_TP)
+
+// ── §8 circuit breaker (unchanged mechanism) ──────────────────────────────────
+circuitBreakerPct = input.float(1.5, "Circuit Breaker %", minval = 0.5, maxval = 5.0, step = 0.1, group = GRP_RISK)
+
+showDebugTable = input.bool(true, "Show Debug Table", group = GRP_VIS)
+showRetestBox  = input.bool(true, "Show Retest Window Box", group = GRP_VIS)
+
+// ── level index constants (§2 tradeable pool — IDH/IDL excluded from index) ───
+int N_LEVELS = 6
+int L_PDH = 0
+int L_PDL = 1
+int L_PMH = 2
+int L_PML = 3
+int L_5MH = 4
+int L_5ML = 5
+
+int LS_IDLE          = 0
+int LS_AWAITING      = 1
+int LS_RESOLVED_PASS = 2
+int LS_RESOLVED_FAIL = 3
+
+int GP_MONITOR         = 0
+int GP_PENDING_IMMED   = 1
+int GP_PENDING_CONFIRM = 2
+int GP_IN_TRADE        = 3
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §2 — KEY LEVELS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// PDH/PDL — prior full session (non-repainting)
+pdh = request.security(syminfo.tickerid, "D", high[1], lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+pdl = request.security(syminfo.tickerid, "D", low[1],  lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+// §2 PMH/PML — premarket 4:00–9:30 ET (stocks/ETFs only), locked at regular open
+bool isStockLike = syminfo.type == "stock" or syminfo.type == "fund" or syminfo.type == "etf"
+
+f_premarketHL() =>
+    var float pmH = na
+    var float pmL = na
+    bool inPM  = not na(time(timeframe.period, "0400-0930:23456", tz))
+    bool regOpen = not na(time(timeframe.period, "0930-0930:23456", tz))
+    if not na(ta.change(time("D")))
+        pmH := na
+        pmL := na
+    if inPM
+        pmH := na(pmH) ? high : math.max(pmH, high)
+        pmL := na(pmL) ? low  : math.min(pmL, low)
+    [pmH, pmL]
+
+[pmh, pml] = request.security(syminfo.tickerid, breakoutTF, f_premarketHL(), lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+// §2 5MH/5ML — first 5m candle of regular session
+f_first5mHL() =>
+    var float mH = na
+    var float mL = na
+    bool first5 = not na(time("5", "0930-0935:23456", tz))
+    if not na(ta.change(time("D")))
+        mH := na
+        mL := na
+    if first5
+        mH := high
+        mL := low
+    [mH, mL]
+
+[fiveMH, fiveML] = request.security(syminfo.tickerid, "5", f_first5mHL(), lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+// §2 IDH/IDL — running session high/low since 9:30 (TP ladder only — never entry trigger)
+f_intradayHL() =>
+    var float iH = na
+    var float iL = na
+    bool inReg = not na(time(timeframe.period, "0930-1600:23456", tz))
+    bool regStart = inReg and not inReg[1]
+    if not na(ta.change(time("D"))) or regStart
+        iH := high
+        iL := low
+    else if inReg
+        iH := math.max(iH, high)
+        iL := math.min(iL, low)
+    [iH, iL]
+
+[idh, idl] = request.security(syminfo.tickerid, breakoutTF, f_intradayHL(), lookahead = barmerge.lookahead_off, gaps = barmerge.gaps_off)
+
+plot(usePDH ? pdh : na, "PDH", color = color.teal, linewidth = 2, style = plot.style_linebr)
+plot(usePDL ? pdl : na, "PDL", color = color.orange, linewidth = 2, style = plot.style_linebr)
+plot(usePMH and isStockLike ? pmh : na, "PMH", color = color.aqua, linewidth = 1, style = plot.style_linebr)
+plot(usePML and isStockLike ? pml : na, "PML", color = color.fuchsia, linewidth = 1, style = plot.style_linebr)
+plot(use5MH ? fiveMH : na, "5MH", color = color.lime, linewidth = 1, style = plot.style_linebr)
+plot(use5ML ? fiveML : na, "5ML", color = color.maroon, linewidth = 1, style = plot.style_linebr)
+plot(idh, "IDH (TP only)", color = color.new(color.gray, 50), linewidth = 1, style = plot.style_circles)
+plot(idl, "IDL (TP only)", color = color.new(color.gray, 50), linewidth = 1, style = plot.style_circles)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4.3 — SESSION + chart TF must match breakoutTF (§11)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+inSession       = not na(time(timeframe.period, sessionWindow, tz))
+isBreakoutChart = timeframe.in_seconds(timeframe.period) == timeframe.in_seconds(breakoutTF)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4 — BREAKOUT ENGINE (generalized level + close[1] inside-level bug fix)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+atrBo   = ta.atr(atrLen)
+rng     = high - low
+bodyPct = rng > 0 ? math.abs(close - open) / rng : 0.0
+
+displacementOk(float level) =>
+    displacementMode == "Distance from Level" ? math.abs(close - level) >= atrMult * atrBo : rng >= atrMult * atrBo
+
+avgVol = ta.sma(volume, todLookbackBars)
+rvolBar(float v) =>
+    not na(avgVol) and avgVol > 0 ? v / avgVol : na
+
+breakoutRvol = rvolBar(volume)
+
+// §4 breakout: close beyond level AND prior close on inside (prevents re-trigger deep inside move)
+breakAbove(float level) =>
+    close > level and close[1] <= level and bodyPct >= bodyPctMin / 100.0 and displacementOk(level) and not na(breakoutRvol) and breakoutRvol >= breakoutRVOLmin
+
+breakBelow(float level) =>
+    close < level and close[1] >= level and bodyPct >= bodyPctMin / 100.0 and displacementOk(level) and not na(breakoutRvol) and breakoutRvol >= breakoutRVOLmin
+
+// §7 structural pivots (shared swing tracker)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+var float trackedSwingLowClose  = na
+var float trackedSwingHighClose = na
+if not na(pl)
+    trackedSwingLowClose := close[pivotRight]
+if not na(ph)
+    trackedSwingHighClose := close[pivotRight]
+
+timeoutBars = retestTF == "1" ? 7 : retestTF == "3" ? 3 : 2
+retestTfSec  = timeframe.in_seconds(retestTF)
+chartTfSec   = timeframe.in_seconds(timeframe.period)
+useLtfRetest = retestTfSec < chartTfSec
+
+// §5 — volume quadrant helpers (UNCHANGED logic)
+f_quadrant(bool isLowPoke, bool reclaimed, float reclaimRvol) =>
+    bool pass = false
+    if isLowPoke
+        pass := reclaimed and not na(reclaimRvol) and reclaimRvol >= reclaimRVOLmin
+    else if not reclaimed
+        pass := false
+    else
+        pass := not na(reclaimRvol) and reclaimRvol >= reclaimRVOLoverride
+    pass
+
+f_internalOk(float bkVol, float pokeAvgVol, float reclaimVol) =>
+    pokeAvgVol <= bkVol * pullbackFraction and reclaimVol >= pokeAvgVol * reclaimMultiplier
+
+f_tradeDir(int originalBreakDir, bool pass) =>
+    pass ? originalBreakDir : -originalBreakDir
+
+f_levelName(int idx) =>
+    idx == L_PDH ? "PDH" : idx == L_PDL ? "PDL" : idx == L_PMH ? "PMH" : idx == L_PML ? "PML" : idx == L_5MH ? "5MH" : "5ML"
+
+f_levelPrice(int idx) =>
+    idx == L_PDH ? pdh : idx == L_PDL ? pdl : idx == L_PMH ? pmh : idx == L_PML ? pml : idx == L_5MH ? fiveMH : fiveML
+
+f_levelEnabled(int idx) =>
+    idx == L_PDH ? usePDH : idx == L_PDL ? usePDL : idx == L_PMH ? (usePMH and isStockLike) : idx == L_PML ? (usePML and isStockLike) : idx == L_5MH ? use5MH : use5ML
+
+f_levelBreakDir(int idx) =>
+    idx == L_PDL or idx == L_PML or idx == L_5ML ? -1 : 1
+
+f_levelValid(int idx) =>
+    f_levelEnabled(idx) and not na(f_levelPrice(idx))
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §3 — MULTI-LEVEL STATE ARRAYS + daily trade sequencing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var array<int>   lvlState         = array.new_int(N_LEVELS, LS_IDLE)
+var array<int>   lvlBreakDir      = array.new_int(N_LEVELS, 0)
+var array<float> lvlBreakLevel    = array.new_float(N_LEVELS, na)
+var array<float> lvlBreakVolume   = array.new_float(N_LEVELS, na)
+var array<float> lvlBreakRvol     = array.new_float(N_LEVELS, na)
+var array<int>   lvlBreakBar      = array.new_int(N_LEVELS, na)
+var array<float> lvlStructSL      = array.new_float(N_LEVELS, na)
+var array<int>   lvlRetestBars    = array.new_int(N_LEVELS, 0)
+var array<bool>  lvlPokeStarted   = array.new_bool(N_LEVELS, false)
+var array<float> lvlPokeVolSum    = array.new_float(N_LEVELS, 0.0)
+var array<int>   lvlPokeBarCount  = array.new_int(N_LEVELS, 0)
+var array<float> lvlPokeRvol      = array.new_float(N_LEVELS, na)
+var array<bool>  lvlRetestDone    = array.new_bool(N_LEVELS, false)
+var array<float> lvlRetestHi      = array.new_float(N_LEVELS, na)
+var array<float> lvlRetestLo      = array.new_float(N_LEVELS, na)
+var array<float> lvlRetestClose   = array.new_float(N_LEVELS, na)
+var box          retestBox        = na
+
+var int    gPhase           = GP_MONITOR
+var int    winnerIdx        = -1
+var bool   winnerPass       = false
+var int    tradesToday      = 0
+var float  firstTradePnl    = na
+var bool   dayDone          = false
+var int    resolveTime      = na
+var int    confirmBars      = 0
+var bool   confirmPlaced    = false
+var bool   immediateFired   = false
+var string pendingEntryId   = ""
+var float  activeSL         = na
+var float  activeCB         = na
+var int    activeWinnerIdx  = -1
+var string dbgOutcome       = ""
+var float  dbgBreakRvol     = na
+var float  dbgPokeRvol      = na
+var float  dbgReclaimRvol   = na
+var float  dbgRMultiple     = na
+var float  dbgTier1         = na
+var float  dbgTier2         = na
+var float  dbgTier3         = na
+var string dbgTier2Src      = ""
+var string dbgTier3Src      = ""
+
+// §3 — daily reset
+newDay = not na(ta.change(time("D")))
+if newDay
+    tradesToday   := 0
+    firstTradePnl := na
+    dayDone       := false
+
+// §3 — track closed trade P&L for daily sequencing
+if strategy.closedtrades > strategy.closedtrades[1]
+    float lastPnl = strategy.closedtrades.profit(strategy.closedtrades - 1)
+    if tradesToday == 1 and na(firstTradePnl)
+        firstTradePnl := lastPnl
+        if lastPnl > 0
+            dayDone := true
+    if tradesToday >= 2
+        dayDone := true
+
+f_resetLevel(int i) =>
+    array.set(lvlState, i, LS_IDLE)
+    array.set(lvlBreakDir, i, 0)
+    array.set(lvlBreakLevel, i, na)
+    array.set(lvlBreakVolume, i, na)
+    array.set(lvlBreakRvol, i, na)
+    array.set(lvlBreakBar, i, na)
+    array.set(lvlStructSL, i, na)
+    array.set(lvlRetestBars, i, 0)
+    array.set(lvlPokeStarted, i, false)
+    array.set(lvlPokeVolSum, i, 0.0)
+    array.set(lvlPokeBarCount, i, 0)
+    array.set(lvlPokeRvol, i, na)
+    array.set(lvlRetestDone, i, false)
+    array.set(lvlRetestHi, i, na)
+    array.set(lvlRetestLo, i, na)
+    array.set(lvlRetestClose, i, na)
+
+f_resetAllLevels() =>
+    for i = 0 to N_LEVELS - 1
+        f_resetLevel(i)
+
+f_canTakeNewSetup() =>
+    not dayDone and inSession and (tradesToday == 0 or (tradesToday == 1 and not na(firstTradePnl) and firstTradePnl < 0))
+
+// §10 — ceiling ladder tier finder
+f_nearestBeyond(float anchor, int tradeDir, int excludeIdx, float fallbackStep) =>
+    float best = na
+    bool usedFallback = true
+    for i = 0 to N_LEVELS - 1
+        if i != excludeIdx and f_levelValid(i)
+            float p = f_levelPrice(i)
+            if tradeDir == 1 and p > anchor
+                best := na(best) or p < best ? p : best
+                usedFallback := false
+            if tradeDir == -1 and p < anchor
+                best := na(best) or p > best ? p : best
+                usedFallback := false
+    if na(best)
+        best := anchor + fallbackStep * tradeDir
+    [best, usedFallback]
+
+f_calcLadderTiers(int tradeDir, int excludeIdx, float entryPx) =>
+    float t1 = tradeDir == 1 ? idh : idl
+    float t1Safe = na(t1) ? entryPx + 0.5 * tradeDir : t1
+    [t2, fb2] = f_nearestBeyond(t1Safe, tradeDir, excludeIdx, 0.5)
+    [t3, fb3] = f_nearestBeyond(t2, tradeDir, excludeIdx, 0.5)
+    [t1Safe, t2, t3, fb2, fb3]
+
+// §4–§6 retest bar processor (unchanged quadrant logic, parameterized by level index)
+f_processRetestBar(int li, float bH, float bL, float bC, float bV) =>
+    bool resolved = false
+    bool passOut  = false
+    if array.get(lvlState, li) == LS_AWAITING and not array.get(lvlRetestDone, li)
+        int bars = array.get(lvlRetestBars, li) + 1
+        array.set(lvlRetestBars, li, bars)
+        float barRvol = rvolBar(bV)
+        float lvl = array.get(lvlBreakLevel, li)
+        int bDir = array.get(lvlBreakDir, li)
+        bool poked = bDir == 1 ? bL <= lvl : bH >= lvl
+        bool reclaimed = bDir == 1 ? bC > lvl : bC < lvl
+        if bars > timeoutBars
+            f_resetLevel(li)
+            log.info(str.format("§4.1 timeout {0} | {1,time,HH:mm}", f_levelName(li), time))
+        else if not array.get(lvlPokeStarted, li) and poked
+            array.set(lvlPokeStarted, li, true)
+            array.set(lvlPokeVolSum, li, bV)
+            array.set(lvlPokeBarCount, li, 1)
+            array.set(lvlPokeRvol, li, barRvol)
+            log.info(str.format("§4.2 poke {0} RVOL={1} | {2,time,HH:mm}", f_levelName(li), barRvol, time))
+        else if array.get(lvlPokeStarted, li)
+            if poked
+                array.set(lvlPokeVolSum, li, array.get(lvlPokeVolSum, li) + bV)
+                array.set(lvlPokeBarCount, li, array.get(lvlPokeBarCount, li) + 1)
+            if reclaimed
+                float pokeAvg = array.get(lvlPokeBarCount, li) > 0 ? array.get(lvlPokeVolSum, li) / array.get(lvlPokeBarCount, li) : bV
+                bool isLowPoke = not na(array.get(lvlPokeRvol, li)) and array.get(lvlPokeRvol, li) <= pokeRVOLmax
+                bool quadPass = f_quadrant(isLowPoke, true, barRvol)
+                bool internal = f_internalOk(array.get(lvlBreakVolume, li), pokeAvg, bV)
+                passOut := quadPass and internal
+                array.set(lvlRetestDone, li, true)
+                array.set(lvlState, li, passOut ? LS_RESOLVED_PASS : LS_RESOLVED_FAIL)
+                array.set(lvlRetestHi, li, bH)
+                array.set(lvlRetestLo, li, bL)
+                array.set(lvlRetestClose, li, bC)
+                resolved := true
+                log.info(str.format("§5 {0} on {1} | {2,time,HH:mm}", passOut ? "PASS" : "FAIL", f_levelName(li), time))
+            else if bars >= timeoutBars
+                passOut := false
+                array.set(lvlRetestDone, li, true)
+                array.set(lvlState, li, LS_RESOLVED_FAIL)
+                array.set(lvlRetestHi, li, bH)
+                array.set(lvlRetestLo, li, bL)
+                array.set(lvlRetestClose, li, bC)
+                resolved := true
+                log.info(str.format("§5 FAIL no reclaim {0} | {1,time,HH:mm}", f_levelName(li), time))
+    [resolved, passOut]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §4–§6 MAIN ENGINE — per confirmed breakout bar
+// ═══════════════════════════════════════════════════════════════════════════════
+
+bool anyBreakBg = false
+
+if barstate.isconfirmed and isBreakoutChart
+
+    // §3 — session end → day done if we were monitoring
+    if not inSession and gPhase == GP_MONITOR
+        dayDone := true
+
+    // §3 + §4 — detect breakouts on all enabled idle levels (only while monitoring & allowed)
+    if gPhase == GP_MONITOR and f_canTakeNewSetup()
+        for i = 0 to N_LEVELS - 1
+            if array.get(lvlState, i) == LS_IDLE and f_levelValid(i)
+                float lp = f_levelPrice(i)
+                int bDir = f_levelBreakDir(i)
+                bool broke = bDir == 1 ? breakAbove(lp) : breakBelow(lp)
+                if broke
+                    array.set(lvlState, i, LS_AWAITING)
+                    array.set(lvlBreakDir, i, bDir)
+                    array.set(lvlBreakLevel, i, lp)
+                    array.set(lvlBreakVolume, i, volume)
+                    array.set(lvlBreakRvol, i, breakoutRvol)
+                    array.set(lvlBreakBar, i, bar_index)
+                    array.set(lvlStructSL, i, bDir == 1 ? trackedSwingLowClose : trackedSwingHighClose)
+                    array.set(lvlRetestBars, i, 0)
+                    array.set(lvlPokeStarted, i, false)
+                    array.set(lvlRetestDone, i, false)
+                    log.info(str.format("§4 BREAKOUT {0} dir={1} lvl={2} RVOL={3} | {4,time,HH:mm}", f_levelName(i), bDir, lp, breakoutRvol, time))
+                    log.info(str.format("§4 AWAITING_RETEST {0} timeout={1}@{2}m", f_levelName(i), timeoutBars, retestTF))
+                    if showRetestBox and na(retestBox)
+                        float pad = atrBo * 0.15
+                        retestBox := box.new(bar_index, lp + pad, bar_index + 3, lp - pad, border_color = color.new(color.blue, 40), bgcolor = color.new(color.blue, 92))
+                    anyBreakBg := true
+
+    // §4–§6 retest + volume quadrant — chronological first-resolve wins (§3)
+    if gPhase == GP_MONITOR and winnerIdx < 0
+        if useLtfRetest
+            [ltfH, ltfL, ltfC, ltfV] = request.security_lower_tf(syminfo.tickerid, retestTF, [high, low, close, volume])
+            int n = array.size(ltfC)
+            if n > 0
+                for j = 0 to n - 1
+                    if winnerIdx < 0
+                        float bH = array.get(ltfH, j)
+                        float bL = array.get(ltfL, j)
+                        float bC = array.get(ltfC, j)
+                        float bV = array.get(ltfV, j)
+                        for li = 0 to N_LEVELS - 1
+                            if winnerIdx < 0 and array.get(lvlState, li) == LS_AWAITING
+                                [resolved, passOut] = f_processRetestBar(li, bH, bL, bC, bV)
+                                if resolved
+                                    winnerIdx := li
+                                    winnerPass := passOut
+                                    resolveTime := time
+                                    dbgOutcome := passOut ? "PASS" : "FAIL"
+                                    dbgPokeRvol := array.get(lvlPokeRvol, li)
+                                    dbgReclaimRvol := rvolBar(bV)
+                                    dbgBreakRvol := array.get(lvlBreakRvol, li)
+                                    break
+        else
+            for li = 0 to N_LEVELS - 1
+                if winnerIdx < 0 and array.get(lvlState, li) == LS_AWAITING
+                    [resolved, passOut] = f_processRetestBar(li, high, low, close, volume)
+                    if resolved
+                        winnerIdx := li
+                        winnerPass := passOut
+                        resolveTime := time
+                        dbgOutcome := passOut ? "PASS" : "FAIL"
+                        dbgPokeRvol := array.get(lvlPokeRvol, li)
+                        dbgReclaimRvol := rvolBar(volume)
+                        dbgBreakRvol := array.get(lvlBreakRvol, li)
+
+        if not na(retestBox)
+            box.set_right(retestBox, bar_index + 1)
+
+        // §3 — first resolver wins
+        if winnerIdx >= 0
+            for i = 0 to N_LEVELS - 1
+                if i != winnerIdx
+                    f_resetLevel(i)
+            log.info(str.format("§3 WINNER {0} | {1,time,HH:mm}", f_levelName(winnerIdx), time))
+            immediateFired := false
+            confirmPlaced := false
+            confirmBars := 0
+            if entryMode == "Immediate"
+                gPhase := GP_PENDING_IMMED
+            else
+                gPhase := GP_PENDING_CONFIRM
+
+    // §8 Immediate — enter at close of next Entry-TF bar after resolve
+    if gPhase == GP_PENDING_IMMED and winnerIdx >= 0 and not immediateFired
+        bool nextEntryClose = false
+        if timeframe.in_seconds(effectiveEntryTF) == chartTfSec
+            nextEntryClose := barstate.isconfirmed and time > resolveTime
+        else
+            array<int> eT = request.security_lower_tf(syminfo.tickerid, effectiveEntryTF, time)
+            int en = array.size(eT)
+            if en > 0
+                for k = 0 to en - 1
+                    if array.get(eT, k) > resolveTime
+                        nextEntryClose := true
+                        break
+        if nextEntryClose
+            immediateFired := true
+            gPhase := GP_IN_TRADE
+
+    // §8 Confirmation — stop entry at retest candle close; cancel rules
+    if gPhase == GP_PENDING_CONFIRM and winnerIdx >= 0
+        float rClose = array.get(lvlRetestClose, winnerIdx)
+        float rLow   = array.get(lvlRetestLo, winnerIdx)
+        float rHigh  = array.get(lvlRetestHi, winnerIdx)
+        int tDir0 = f_tradeDir(array.get(lvlBreakDir, winnerIdx), winnerPass)
+        pendingEntryId := tDir0 == 1 ? "Long" : "Short"
+        if not confirmPlaced and not na(rClose) and strategy.position_size == 0
+            strategy.entry(pendingEntryId, tDir0 == 1 ? strategy.long : strategy.short, stop = rClose)
+            confirmPlaced := true
+            log.info(str.format("§8 CONFIRM stop placed @ {0} | {1,time,HH:mm}", rClose, time))
+        if confirmPlaced and strategy.position_size == 0
+            confirmBars += 1
+            bool oppBreak = tDir0 == 1 ? close < rLow : close > rHigh
+            bool timeOut3 = confirmBars > 3
+            if timeOut3 or oppBreak
+                strategy.cancel(pendingEntryId)
+                log.info(str.format("§8 CONFIRM CANCEL: {0} | {1,time,HH:mm}", timeOut3 ? "3-bar timeout" : "opposite extreme", time))
+                gPhase := GP_MONITOR
+                winnerIdx := -1
+                confirmPlaced := false
+                f_resetAllLevels()
+                if not na(retestBox)
+                    box.delete(retestBox)
+                    retestBox := na
+            else if strategy.position_size != 0
+                gPhase := GP_IN_TRADE
+                log.info(str.format("§8 CONFIRM FILLED | {0,time,HH:mm}", time))
+
+    // §6 + §8–§10 — Immediate entry + risk setup; Confirmation uses block below when filled
+    if gPhase == GP_IN_TRADE and strategy.position_size == 0 and winnerIdx >= 0 and entryMode == "Immediate"
+        int tDir = f_tradeDir(array.get(lvlBreakDir, winnerIdx), winnerPass)
+        string entryId = tDir == 1 ? "Long" : "Short"
+        float entryPrice = close
+        float slPrice = slMode == "Structural Swing Point" ? array.get(lvlStructSL, winnerIdx) :
+             (tDir == 1 ? array.get(lvlRetestLo, winnerIdx) : array.get(lvlRetestHi, winnerIdx))
+        if na(slPrice)
+            log.info("§9 missing SL anchor — abort entry")
+            gPhase := GP_MONITOR
+            winnerIdx := -1
+            f_resetAllLevels()
+            if not na(retestBox)
+                box.delete(retestBox)
+                retestBox := na
+        else
+            float risk = tDir == 1 ? entryPrice - slPrice : slPrice - entryPrice
+            if risk <= syminfo.mintick
+                log.info("§9 invalid risk — abort entry")
+                gPhase := GP_MONITOR
+                winnerIdx := -1
+                f_resetAllLevels()
+                if not na(retestBox)
+                    box.delete(retestBox)
+                    retestBox := na
+            else
+                activeSL := slPrice
+                activeWinnerIdx := winnerIdx
+                float cbPrice = tDir == 1 ? entryPrice * (1.0 - circuitBreakerPct / 100.0) : entryPrice * (1.0 + circuitBreakerPct / 100.0)
+                if tDir == 1 and cbPrice >= slPrice
+                    cbPrice := slPrice - syminfo.mintick * 10
+                if tDir == -1 and cbPrice <= slPrice
+                    cbPrice := slPrice + syminfo.mintick * 10
+                activeCB := cbPrice
+                strategy.entry(entryId, tDir == 1 ? strategy.long : strategy.short)
+                tradesToday += 1
+                if tpMode == "Fixed 2R"
+                    float tpPrice = tDir == 1 ? entryPrice + tpRMultiple * risk : entryPrice - tpRMultiple * risk
+                    strategy.exit(entryId + " CB", entryId, stop = cbPrice, limit = tpPrice)
+                    dbgTier1 := tpPrice
+                    dbgTier2Src := "2R"
+                    dbgTier3Src := "—"
+                    line.new(bar_index, entryPrice, bar_index + 20, entryPrice, color = color.green, width = 2)
+                    line.new(bar_index, slPrice, bar_index + 20, slPrice, color = color.red, width = 2, style = line.style_dashed)
+                    line.new(bar_index, cbPrice, bar_index + 20, cbPrice, color = color.new(color.red, 50), style = line.style_dotted)
+                    line.new(bar_index, tpPrice, bar_index + 20, tpPrice, color = color.new(color.green, 40), width = 2)
+                else
+                    // §10 Ceiling Ladder — 3 tier partial limits + circuit breaker
+                    [t1, t2, t3, fb2, fb3] = f_calcLadderTiers(tDir, winnerIdx, entryPrice)
+                    dbgTier1 := t1
+                    dbgTier2 := t2
+                    dbgTier3 := t3
+                    dbgTier2Src := fb2 ? "$0.50" : "level"
+                    dbgTier3Src := fb3 ? "$0.50" : "level"
+                    float q3 = math.max(0.0, 100.0 - tier1Pct - tier2Pct)
+                    strategy.exit(entryId + " T1", entryId, limit = t1, qty_percent = tier1Pct, stop = cbPrice)
+                    strategy.exit(entryId + " T2", entryId, limit = t2, qty_percent = tier2Pct)
+                    strategy.exit(entryId + " T3", entryId, limit = t3, qty_percent = q3)
+                log.info(str.format("§6–10 IN_TRADE {0} via {1} SL={2} mode={3} TP={4} | {5,time,HH:mm}", f_levelName(winnerIdx), entryId, slPrice, slMode, tpMode, time))
+                f_resetAllLevels()
+                if not na(retestBox)
+                    box.delete(retestBox)
+                    retestBox := na
+                winnerIdx := -1
+
+    // §8 Confirmation filled — configure SL/TP on first bar in position
+    if gPhase == GP_IN_TRADE and strategy.position_size != 0 and na(activeSL) and winnerIdx >= 0 and entryMode == "Confirmation"
+        int tDirC = f_tradeDir(array.get(lvlBreakDir, winnerIdx), winnerPass)
+        string entryIdC = tDirC == 1 ? "Long" : "Short"
+        float entryPriceC = strategy.position_avg_price
+        float slPriceC = slMode == "Structural Swing Point" ? array.get(lvlStructSL, winnerIdx) :
+             (tDirC == 1 ? array.get(lvlRetestLo, winnerIdx) : array.get(lvlRetestHi, winnerIdx))
+        if not na(slPriceC)
+            float riskC = tDirC == 1 ? entryPriceC - slPriceC : slPriceC - entryPriceC
+            activeSL := slPriceC
+            activeWinnerIdx := winnerIdx
+            float cbPriceC = tDirC == 1 ? entryPriceC * (1.0 - circuitBreakerPct / 100.0) : entryPriceC * (1.0 + circuitBreakerPct / 100.0)
+            if tDirC == 1 and cbPriceC >= slPriceC
+                cbPriceC := slPriceC - syminfo.mintick * 10
+            if tDirC == -1 and cbPriceC <= slPriceC
+                cbPriceC := slPriceC + syminfo.mintick * 10
+            activeCB := cbPriceC
+            tradesToday += 1
+            if tpMode == "Fixed 2R"
+                float tpPriceC = tDirC == 1 ? entryPriceC + tpRMultiple * riskC : entryPriceC - tpRMultiple * riskC
+                strategy.exit(entryIdC + " CB", entryIdC, stop = cbPriceC, limit = tpPriceC)
+                dbgTier1 := tpPriceC
+            else
+                [t1c, t2c, t3c, fb2c, fb3c] = f_calcLadderTiers(tDirC, winnerIdx, entryPriceC)
+                dbgTier1 := t1c
+                dbgTier2 := t2c
+                dbgTier3 := t3c
+                dbgTier2Src := fb2c ? "$0.50" : "level"
+                dbgTier3Src := fb3c ? "$0.50" : "level"
+                float q3c = math.max(0.0, 100.0 - tier1Pct - tier2Pct)
+                strategy.exit(entryIdC + " T1", entryIdC, limit = t1c, qty_percent = tier1Pct, stop = cbPriceC)
+                strategy.exit(entryIdC + " T2", entryIdC, limit = t2c, qty_percent = tier2Pct)
+                strategy.exit(entryIdC + " T3", entryIdC, limit = t3c, qty_percent = q3c)
+            log.info(str.format("§8–10 CONFIRM trade live {0} | {1,time,HH:mm}", f_levelName(winnerIdx), time))
+            f_resetAllLevels()
+            if not na(retestBox)
+                box.delete(retestBox)
+                retestBox := na
+            winnerIdx := -1
+    if strategy.position_size != 0 and not na(activeSL)
+        if strategy.position_size > 0 and close < activeSL
+            strategy.close("Long", comment = "§9 SL close")
+            log.info(str.format("§9 SL long close | {0,time,HH:mm} close={1}", time, close))
+        if strategy.position_size < 0 and close > activeSL
+            strategy.close("Short", comment = "§9 SL close")
+            log.info(str.format("§9 SL short close | {0,time,HH:mm} close={1}", time, close))
+
+    if strategy.position_size != 0 and not na(activeSL)
+        float ep = strategy.position_avg_price
+        float rk = strategy.position_size > 0 ? ep - activeSL : activeSL - ep
+        if rk > 0
+            dbgRMultiple := strategy.position_size > 0 ? (close - ep) / rk : (ep - close) / rk
+
+    // §3 — return to monitor after flat (if day not done)
+    if gPhase == GP_IN_TRADE and strategy.position_size == 0
+        gPhase := GP_MONITOR
+        activeSL := na
+        activeCB := na
+        if f_canTakeNewSetup()
+            log.info(str.format("§3 back to MONITOR trades_today={0} | {1,time,HH:mm}", tradesToday, time))
+        else
+            dayDone := true
+            log.info(str.format("§3 DAY_DONE trades_today={0} | {1,time,HH:mm}", tradesToday, time))
+
+// §4 breakout highlight (global scope — bgcolor cannot be used in local scope)
+bgcolor(anyBreakBg ? color.new(color.green, 88) : na, title = "§4 Breakout")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// §7 — DEBUG TABLE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var table dbgTable = na
+if showDebugTable and barstate.islast
+    if na(dbgTable)
+        dbgTable := table.new(position.top_right, 2, 16, border_width = 1)
+    string phaseStr = gPhase == GP_MONITOR ? "MONITOR" : gPhase == GP_PENDING_IMMED ? "PEND_IMMED" : gPhase == GP_PENDING_CONFIRM ? "PEND_CONFIRM" : "IN_TRADE"
+    string winStr = winnerIdx >= 0 ? f_levelName(winnerIdx) : activeWinnerIdx >= 0 ? f_levelName(activeWinnerIdx) : "—"
+    table.cell(dbgTable, 0, 0, "Phase", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 0, phaseStr)
+    table.cell(dbgTable, 0, 1, "Level", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 1, winStr)
+    table.cell(dbgTable, 0, 2, "Entry Mode", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 2, entryMode)
+    table.cell(dbgTable, 0, 3, "SL Mode", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 3, slMode)
+    table.cell(dbgTable, 0, 4, "TP Mode", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 4, tpMode)
+    table.cell(dbgTable, 0, 5, "Trades Today", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 5, str.tostring(tradesToday) + (dayDone ? " DONE" : ""))
+    table.cell(dbgTable, 0, 6, "Break RVOL", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 6, na(dbgBreakRvol) ? "—" : str.tostring(dbgBreakRvol, "#.##"))
+    table.cell(dbgTable, 0, 7, "Poke RVOL", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 7, na(dbgPokeRvol) ? "—" : str.tostring(dbgPokeRvol, "#.##"))
+    table.cell(dbgTable, 0, 8, "Reclaim RVOL", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 8, na(dbgReclaimRvol) ? "—" : str.tostring(dbgReclaimRvol, "#.##"))
+    table.cell(dbgTable, 0, 9, "R-mult", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 9, na(dbgRMultiple) ? "—" : str.tostring(dbgRMultiple, "#.##"))
+    table.cell(dbgTable, 0, 10, "Outcome", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 10, dbgOutcome == "" ? "—" : dbgOutcome)
+    table.cell(dbgTable, 0, 11, "Breakout TF", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 11, isBreakoutChart ? breakoutTF + " OK" : "NEED " + breakoutTF)
+    table.cell(dbgTable, 0, 12, "Tier 1", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 12, na(dbgTier1) ? "—" : str.tostring(dbgTier1, "#.##"))
+    table.cell(dbgTable, 0, 13, "Tier 2", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 13, na(dbgTier2) ? "—" : str.tostring(dbgTier2, "#.##") + " " + dbgTier2Src)
+    table.cell(dbgTable, 0, 14, "Tier 3", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 14, na(dbgTier3) ? "—" : str.tostring(dbgTier3, "#.##") + " " + dbgTier3Src)
+    table.cell(dbgTable, 0, 15, "Ladder %", bgcolor = color.gray)
+    table.cell(dbgTable, 1, 15, tpMode == "Ceiling Ladder" ? str.tostring(tier1Pct, "#") + "/" + str.tostring(tier2Pct, "#") + "/" + str.tostring(math.max(0.0, 100.0 - tier1Pct - tier2Pct), "#") : "—")

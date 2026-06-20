@@ -1,0 +1,72 @@
+<svg viewBox="0 0 900 480" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow4" markerWidth="9" markerHeight="9" refX="4.5" refY="4.5" orient="auto">
+      <path d="M0,0 L9,4.5 L0,9 Z" fill="#374151"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="480" fill="#ffffff"/>
+
+  <text x="450" y="26" font-size="17" font-weight="bold" fill="#111827" text-anchor="middle">Session Window &amp; Retest Timeout</text>
+
+  <!-- session banner -->
+  <rect x="60" y="40" width="780" height="32" rx="7" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="450" y="61" font-size="12.5" font-weight="bold" fill="#374151" text-anchor="middle">Session gate: 9:30 – 11:30 AM ET — break, retest, and entry must all occur inside this window</text>
+
+  <!-- main timeline -->
+  <line x1="80" y1="120" x2="860" y2="120" stroke="#374151" stroke-width="2" marker-end="url(#arrow4)"/>
+  <line x1="80" y1="112" x2="80" y2="128" stroke="#374151" stroke-width="2"/>
+  <line x1="275" y1="112" x2="275" y2="128" stroke="#374151" stroke-width="1.5"/>
+  <line x1="470" y1="112" x2="470" y2="128" stroke="#374151" stroke-width="1.5"/>
+  <line x1="665" y1="112" x2="665" y2="128" stroke="#374151" stroke-width="1.5"/>
+  <line x1="855" y1="112" x2="855" y2="128" stroke="#374151" stroke-width="1.5"/>
+  <text x="80" y="146" font-size="11.5" fill="#4b5563" text-anchor="middle">9:30</text>
+  <text x="275" y="146" font-size="11.5" fill="#4b5563" text-anchor="middle">10:00</text>
+  <text x="470" y="146" font-size="11.5" fill="#4b5563" text-anchor="middle">10:30</text>
+  <text x="665" y="146" font-size="11.5" fill="#4b5563" text-anchor="middle">11:00</text>
+  <text x="855" y="146" font-size="11.5" fill="#4b5563" text-anchor="middle">11:30</text>
+
+  <!-- breakout marker -->
+  <line x1="372" y1="90" x2="372" y2="120" stroke="#ea580c" stroke-width="2" stroke-dasharray="5,3"/>
+  <circle cx="372" cy="120" r="4.5" fill="#ea580c"/>
+  <text x="372" y="78" font-size="12" font-weight="bold" fill="#9a3412" text-anchor="middle">Breakout occurs (example time)</text>
+
+  <!-- connector down to zoom section -->
+  <line x1="372" y1="124" x2="372" y2="175" stroke="#9ca3af" stroke-width="1.5" stroke-dasharray="3,3"/>
+  <text x="372" y="190" font-size="11.5" fill="#6b7280" text-anchor="middle" font-style="italic">retest countdown starts the bar after the break confirms</text>
+
+  <text x="450" y="215" font-size="13.5" font-weight="bold" fill="#111827" text-anchor="middle">Retest timeout — converges to roughly the same real-world window</text>
+  <text x="450" y="231" font-size="11.5" fill="#6b7280" text-anchor="middle">regardless of which retest timeframe is configured</text>
+
+  <!-- Row 1m: 7 bars x 40px -->
+  <text x="120" y="255" font-size="12.5" font-weight="bold" fill="#1d4ed8" text-anchor="start">1m</text>
+  <g>
+    <rect x="150" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+    <rect x="194" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+    <rect x="238" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+    <rect x="282" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+    <rect x="326" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+    <rect x="370" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+    <rect x="414" y="243" width="40" height="28" fill="#dbeafe" stroke="#2563eb"/>
+  </g>
+  <text x="465" y="261" font-size="12" fill="#1e3a8a">7 bars = 7 min</text>
+
+  <!-- Row 3m: 3 bars x 120px -->
+  <text x="120" y="315" font-size="12.5" font-weight="bold" fill="#1d4ed8" text-anchor="start">3m</text>
+  <g>
+    <rect x="150" y="303" width="120" height="28" fill="#bfdbfe" stroke="#2563eb"/>
+    <rect x="274" y="303" width="120" height="28" fill="#bfdbfe" stroke="#2563eb"/>
+    <rect x="398" y="303" width="120" height="28" fill="#bfdbfe" stroke="#2563eb"/>
+  </g>
+  <text x="535" y="321" font-size="12" fill="#1e3a8a">3 bars = 9 min</text>
+
+  <!-- Row 5m: 2 bars x 200px -->
+  <text x="120" y="375" font-size="12.5" font-weight="bold" fill="#1d4ed8" text-anchor="start">5m</text>
+  <g>
+    <rect x="150" y="363" width="200" height="28" fill="#93c5fd" stroke="#2563eb"/>
+    <rect x="354" y="363" width="200" height="28" fill="#93c5fd" stroke="#2563eb"/>
+  </g>
+  <text x="570" y="381" font-size="12" fill="#1e3a8a">2 bars = 10 min</text>
+
+  <text x="450" y="430" font-size="12" fill="#374151" text-anchor="middle" font-weight="bold">Only the FIRST retest within the window counts.</text>
+  <text x="450" y="448" font-size="11.5" fill="#6b7280" text-anchor="middle">No resolution by timeout → setup is invalidated for that level for the rest of the session.</text>
+</svg>
