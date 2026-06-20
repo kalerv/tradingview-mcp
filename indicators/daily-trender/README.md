@@ -10,7 +10,7 @@ Relative strength watchlist table vs a configurable benchmark.
 | `scripts/v10/` | v10 | Benchmark row + YTrend (intraday engine) |
 | `scripts/v11/` | v11 | Configurable columns, ADX, RVOL |
 | `scripts/v12/` | v12 | ADX/RVOL threshold color coding |
-| `scripts/v13/` | **v13.0.0-rc2** | **Release candidate** — Traders Lab settings + request merge + Trend fix |
+| `scripts/v13-rel-cand-2/` | **v13.0.0-rc2** | **Release candidate** — Traders Lab settings + request merge + Trend fix |
 
 ## Which to use
 
@@ -18,4 +18,4 @@ Relative strength watchlist table vs a configurable benchmark.
 - **v10** — pinned benchmark row + YTrend
 - **v11** — configurable columns, ADX, RVOL, no LB
 - **v12** — ADX/RVOL color tiers (20 / 25 / 2.0)
-- **v13 (rc2)** — Traders Lab parity: ADX TF, filters, alerts, color toggles; RE10137 fix; Trend Long/Short/Flat
+- **v13-rel-cand-2 (rc2)** — Traders Lab parity: ADX TF, filters, alerts, color toggles; RE10137 fix; Trend Long/Short/Flat

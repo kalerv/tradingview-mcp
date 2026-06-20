@@ -59,6 +59,6 @@ Pine allows **40 unique `request.*()` calls** per script. v13 merges session, AD
 ## Push
 
 ```bash
-node src/cli/index.js pine set --file indicators/daily-trender/scripts/v13/daily_trender.pine
+node src/cli/index.js pine set --file indicators/daily-trender/scripts/v13-rel-cand-2/daily_trender.pine
 node src/cli/index.js pine compile
 ```

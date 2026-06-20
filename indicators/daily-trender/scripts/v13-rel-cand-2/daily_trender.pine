@@ -1,6 +1,6 @@
 //@version=6
 // daily-trender v13.0.0-rc2 — based on v12
-// Path: indicators/daily-trender/scripts/v13/daily_trender.pine
+// Path: indicators/daily-trender/scripts/v13-rel-cand-2/daily_trender.pine
 // Traders Lab parity: ADX/RVOL/PrevD/PreMkt settings, filters, alerts, color toggles.
 
 indicator("Relative Strength vs Benchmark (Table)", overlay = true, behind_chart = false)
