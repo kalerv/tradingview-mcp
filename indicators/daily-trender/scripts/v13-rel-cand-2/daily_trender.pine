@@ -17,7 +17,10 @@ benchmarkSym    = benchmarkPreset == "Custom" ? benchmarkCustom : benchmarkPrese
 // =========================================================================
 maxSymbols     = input.int(10, "Max symbols to fetch", minval = 1, maxval = 18, group = "Settings",
      tooltip = "Pine limits unique request.*() calls to 40. Default 10 keeps headroom (≈1–2 calls per symbol).")
-sortByStrength = input.bool(true, "Sort table by strongest first (by Since Open spread)", group = "Settings")
+sortByStrength = input.bool(true, "Sort strongest → top, weakest → bottom", group = "Settings")
+sortMetric     = input.string("RS vs benchmark", "Sort by",
+     options = ["RS vs benchmark", "Open % since RTH open"], group = "Settings",
+     tooltip = "RS = Open % minus benchmark Open %. Matches the RS column.")
 theme          = input.string("Dark", "Table Theme", options = ["Dark", "Light"], group = "Settings")
 sessionTz      = input.string("America/New_York", "Session Timezone", group = "Settings")
 
@@ -435,6 +438,12 @@ f_rvolCell(tbl, col, row, v, rowBg) =>
     tc = colorRVOL ? color.white : txtMain
     table.cell(tbl, col, row, f_fmtRvol(v), bgcolor = bg, text_color = tc, text_size = tblSize)
 
+f_rowSpread(idx) =>
+    array.get(sinceOpenArr, idx) - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
+
+f_sortKey(idx) =>
+    sortMetric == "Open % since RTH open" ? array.get(sinceOpenArr, idx) : f_rowSpread(idx)
+
 // =========================================================================
 // TABLE
 // =========================================================================
@@ -461,9 +470,7 @@ if tableDraw and n > 0 and totalCols > 0
             for j = 0 to rows - 2 - i
                 idxA = array.get(order, j)
                 idxB = array.get(order, j + 1)
-                spreadA = array.get(sinceOpenArr, idxA) - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
-                spreadB = array.get(sinceOpenArr, idxB) - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
-                if spreadB > spreadA
+                if f_sortKey(idxB) > f_sortKey(idxA)
                     array.set(order, j, idxB)
                     array.set(order, j + 1, idxA)
 
@@ -598,7 +605,7 @@ if tableDraw and n > 0 and totalCols > 0
             prevD  = (na(pdhVal) or na(pdlVal) or na(cNowR)) ? "—" : f_rangeLabel(cNowR, pdhVal, pdlVal)
             preMkt = (na(pmhVal) or na(pmlVal) or na(cNowR)) ? "—" : f_rangeLabel(cNowR, pmhVal, pmlVal)
 
-            spread = sOpenRet - (na(qqqSinceOpen) ? 0.0 : qqqSinceOpen)
+            spread = f_rowSpread(idx)
             rsSym   = spread > 0.05 ? "▲" : spread < -0.05 ? "▼" : "•"
             rsColor = spread > 0.05 ? color.new(color.green, 0) : spread < -0.05 ? color.new(color.red, 0) : neutralBg
 
