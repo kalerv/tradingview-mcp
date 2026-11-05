@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tradingview": {
+      "command": "node",
+      "args": ["/Users/kalerv/zynfosoft/tradingview-mcp/src/server.js"]
+    }
+  }
+}

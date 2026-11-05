@@ -1,0 +1,208 @@
+//@version=6
+// MNQ 9:29 Close Momentum v1.0.0
+
+strategy(
+     title                   = "MNQ 9:29 Close Momentum",
+     shorttitle              = "MNQ 9:29",
+     overlay                 = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 10,
+     initial_capital         = 625000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.62,
+     slippage                = 1,
+     calc_on_order_fills     = true,
+     process_orders_on_close = true)
+
+string GRP_SESSION = "Session"
+string GRP_ENTRY   = "Entry"
+string GRP_RISK    = "Risk"
+string GRP_TARGETS = "Profit Targets"
+string GRP_FILTER  = "Filters"
+string GRP_VISUAL  = "Visuals"
+
+string sessionTz = input.string("America/New_York", "Timezone", group = GRP_SESSION)
+string rthSession = input.session("0930-1600", "Position management session", group = GRP_SESSION)
+bool closeAtSessionEnd = input.bool(true, "Close position at 16:00 ET", group = GRP_SESSION)
+bool reverseSignalDirection = input.bool(false, "Reverse signal direction", group = GRP_ENTRY,
+     tooltip = "Reverses the final trade direction after the original bullish or bearish setup passes its direction-specific filters.")
+int contracts = input.int(10, "Contracts", minval = 10, maxval = 100, group = GRP_RISK)
+
+float stopPoints = input.float(50.0, "Stop loss (points)", minval = 0.25, step = 0.25, group = GRP_RISK)
+bool useBreakEven = input.bool(true, "Move stop to breakeven", group = GRP_RISK)
+float breakEvenTrigger = input.float(50.0, "Breakeven trigger (points)", minval = 0.25, step = 0.25, group = GRP_RISK,
+     tooltip = "When price touches this profit, move the stop to the position's average entry price.")
+bool trailAfterTp2 = input.bool(true, "After TP2, move remaining stop to TP1", group = GRP_RISK)
+
+int targetCount = input.int(3, "Number of profit targets", minval = 1, maxval = 3, group = GRP_TARGETS)
+float tp1Points = input.float(50.0, "TP1 (points)", minval = 0.25, step = 0.25, group = GRP_TARGETS)
+int tp1Contracts = input.int(4, "TP1 contracts", minval = 1, maxval = 98, group = GRP_TARGETS,
+     tooltip = "For 2–3 targets. The script reserves at least one contract for each later target.")
+float tp2Points = input.float(100.0, "TP2 (points)", minval = 0.50, step = 0.25, group = GRP_TARGETS)
+int tp2Contracts = input.int(3, "TP2 contracts", minval = 1, maxval = 98, group = GRP_TARGETS,
+     tooltip = "Used with 3 targets. Remaining contracts are assigned to TP3.")
+float tp3Points = input.float(150.0, "TP3 (points)", minval = 0.75, step = 0.25, group = GRP_TARGETS)
+
+bool useVwapFilter = input.bool(true, "Use Session VWAP filter", group = GRP_FILTER,
+     tooltip = "Uses ta.vwap(hlc3), which includes the chart's current daily/session data. Original bullish setups require a close above; original bearish setups require a close below. This is evaluated before reversal.")
+bool useEma9Filter = input.bool(true, "Use EMA 9 filter", group = GRP_FILTER,
+     tooltip = "Original bullish setups require the 09:29 close above EMA 9; original bearish setups require it below. This is evaluated before reversal.")
+bool useEma21Filter = input.bool(true, "Use EMA 21 filter", group = GRP_FILTER,
+     tooltip = "Original bullish setups require the 09:29 close above EMA 21; original bearish setups require it below. This is evaluated before reversal.")
+bool useEma50Filter = input.bool(true, "Use EMA 50 filter", group = GRP_FILTER,
+     tooltip = "Original bullish setups require the 09:29 close above EMA 50; original bearish setups require it below. This is evaluated before reversal.")
+
+bool showVwap = input.bool(true, "Show Session VWAP", group = GRP_VISUAL)
+bool showEmas = input.bool(true, "Show EMA 9 / 21 / 50", group = GRP_VISUAL)
+bool markSignalBar = input.bool(true, "Highlight 09:29 signal bar", group = GRP_VISUAL)
+
+bool isOneMinute = timeframe.isminutes and timeframe.multiplier == 1
+bool inRth = not na(time(timeframe.period, rthSession, sessionTz))
+int etYear = year(time, sessionTz)
+int etMonth = month(time, sessionTz)
+int etDay = dayofmonth(time, sessionTz)
+bool rthEndBar = inRth and time_close >= timestamp(sessionTz, etYear, etMonth, etDay, 16, 0)
+bool is0928Bar = hour(time, sessionTz) == 9 and minute(time, sessionTz) == 28
+bool isSignalBar = hour(time, sessionTz) == 9 and minute(time, sessionTz) == 29
+int signalDate = etYear * 10000 + etMonth * 100 + etDay
+
+float sessionVwap = ta.vwap(hlc3)
+float ema9 = ta.ema(close, 9)
+float ema21 = ta.ema(close, 21)
+float ema50 = ta.ema(close, 50)
+
+var float close0928 = na
+var int close0928Date = na
+var int lastSignalDate = na
+var bool breakEvenArmed = false
+var bool tp2Hit = false
+var int lastEntryBar = na
+var int lastExitBar = na
+
+int prevSignalDate = year(time[1], sessionTz) * 10000 + month(time[1], sessionTz) * 100 + dayofmonth(time[1], sessionTz)
+bool newDayEt = na(time[1]) or signalDate != prevSignalDate
+if newDayEt
+    close0928 := na
+    close0928Date := na
+    breakEvenArmed := false
+    tp2Hit := false
+    lastEntryBar := na
+    lastExitBar := na
+
+if isOneMinute and barstate.isconfirmed and is0928Bar
+    close0928 := close
+    close0928Date := signalDate
+
+bool newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0 and
+     (na(lastEntryBar) or bar_index != lastEntryBar)
+bool newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0 and
+     (na(lastEntryBar) or bar_index != lastEntryBar)
+bool positionClosed = strategy.position_size == 0 and strategy.position_size[1] != 0 and
+     (na(lastExitBar) or bar_index != lastExitBar)
+
+if newLong or newShort
+    breakEvenArmed := false
+    tp2Hit := false
+    lastEntryBar := bar_index
+
+if positionClosed
+    breakEvenArmed := false
+    tp2Hit := false
+    lastExitBar := bar_index
+
+bool longVwapOk = not useVwapFilter or (not na(sessionVwap) and close > sessionVwap)
+bool shortVwapOk = not useVwapFilter or (not na(sessionVwap) and close < sessionVwap)
+bool longEmaOk = (not useEma9Filter or close > ema9) and
+     (not useEma21Filter or close > ema21) and
+     (not useEma50Filter or close > ema50)
+bool shortEmaOk = (not useEma9Filter or close < ema9) and
+     (not useEma21Filter or close < ema21) and
+     (not useEma50Filter or close < ema50)
+
+// The open/color of the 09:29 candle is irrelevant. Direction is the
+// 09:29 close relative to the stored 09:28 close for the same ET day.
+bool has0928Close = not na(close0928) and close0928Date == signalDate
+bool closedTradeEnteredThisBar = strategy.closedtrades > 0 and
+     strategy.closedtrades.entry_bar_index(strategy.closedtrades - 1) == bar_index
+bool maySignal = isOneMinute and barstate.isconfirmed and isSignalBar and has0928Close and strategy.position_size == 0 and
+     strategy.opentrades == 0 and not closedTradeEnteredThisBar and (na(lastSignalDate) or lastSignalDate != signalDate)
+bool bullishSetupValid = isOneMinute and barstate.isconfirmed and isSignalBar and has0928Close and
+     close > close0928 and longVwapOk and longEmaOk
+bool bearishSetupValid = isOneMinute and barstate.isconfirmed and isSignalBar and has0928Close and
+     close < close0928 and shortVwapOk and shortEmaOk
+bool finalLongSetup = reverseSignalDirection ? bearishSetupValid : bullishSetupValid
+bool finalShortSetup = reverseSignalDirection ? bullishSetupValid : bearishSetupValid
+bool finalLongSignal = maySignal and finalLongSetup
+bool finalShortSignal = maySignal and finalShortSetup
+
+if finalLongSignal
+    lastSignalDate := signalDate
+    strategy.entry("9:29 Long", strategy.long, qty = contracts)
+else if finalShortSignal
+    lastSignalDate := signalDate
+    strategy.entry("9:29 Short", strategy.short, qty = contracts)
+
+float tp1Distance = tp1Points
+float tp2Distance = math.max(tp2Points, tp1Distance + syminfo.mintick)
+float tp3Distance = math.max(tp3Points, tp2Distance + syminfo.mintick)
+
+int tp1Qty = targetCount == 1 ? contracts : math.min(tp1Contracts, contracts - targetCount + 1)
+int remainingAfterTp1 = contracts - tp1Qty
+int tp2Qty = targetCount == 2 ? remainingAfterTp1 :
+     targetCount == 3 ? math.min(tp2Contracts, remainingAfterTp1 - 1) : 0
+int tp3Qty = targetCount == 3 ? contracts - tp1Qty - tp2Qty : 0
+float openContracts = math.abs(strategy.position_size)
+
+if strategy.position_size > 0
+    if useBreakEven and high >= strategy.position_avg_price + breakEvenTrigger
+        breakEvenArmed := true
+    if targetCount == 3 and openContracts <= tp3Qty
+        tp2Hit := true
+    float longBaseStop = breakEvenArmed ? strategy.position_avg_price : strategy.position_avg_price - stopPoints
+    float longRunnerStop = trailAfterTp2 and tp2Hit ?
+         strategy.position_avg_price + tp1Distance : longBaseStop
+    if targetCount == 1 or openContracts > contracts - tp1Qty
+        strategy.exit("Long TP1", "9:29 Long", qty = tp1Qty,
+             stop = longBaseStop, limit = strategy.position_avg_price + tp1Distance)
+    if targetCount >= 2 and openContracts > (targetCount == 3 ? tp3Qty : 0)
+        strategy.exit("Long TP2", "9:29 Long", qty = tp2Qty,
+             stop = longBaseStop, limit = strategy.position_avg_price + tp2Distance)
+    if targetCount == 3
+        strategy.exit("Long TP3", "9:29 Long", qty = tp3Qty,
+             stop = longRunnerStop, limit = strategy.position_avg_price + tp3Distance)
+
+if strategy.position_size < 0
+    if useBreakEven and low <= strategy.position_avg_price - breakEvenTrigger
+        breakEvenArmed := true
+    if targetCount == 3 and openContracts <= tp3Qty
+        tp2Hit := true
+    float shortBaseStop = breakEvenArmed ? strategy.position_avg_price : strategy.position_avg_price + stopPoints
+    float shortRunnerStop = trailAfterTp2 and tp2Hit ?
+         strategy.position_avg_price - tp1Distance : shortBaseStop
+    if targetCount == 1 or openContracts > contracts - tp1Qty
+        strategy.exit("Short TP1", "9:29 Short", qty = tp1Qty,
+             stop = shortBaseStop, limit = strategy.position_avg_price - tp1Distance)
+    if targetCount >= 2 and openContracts > (targetCount == 3 ? tp3Qty : 0)
+        strategy.exit("Short TP2", "9:29 Short", qty = tp2Qty,
+             stop = shortBaseStop, limit = strategy.position_avg_price - tp2Distance)
+    if targetCount == 3
+        strategy.exit("Short TP3", "9:29 Short", qty = tp3Qty,
+             stop = shortRunnerStop, limit = strategy.position_avg_price - tp3Distance)
+
+if rthEndBar and closeAtSessionEnd and strategy.position_size != 0
+    strategy.close_all(comment = "16:00 ET close", immediately = true)
+
+plot(showVwap ? sessionVwap : na, "Session VWAP", color = color.aqua, linewidth = 2)
+plot(showEmas ? ema9 : na, "EMA 9", color = color.yellow)
+plot(showEmas ? ema21 : na, "EMA 21", color = color.orange)
+plot(showEmas ? ema50 : na, "EMA 50", color = color.purple)
+bgcolor(markSignalBar and isSignalBar ? color.new(finalLongSetup ? color.lime : finalShortSetup ? color.red : color.gray, 86) : na,
+     title = "09:29 Signal Bar")
+
+var table warning = table.new(position.top_right, 1, 1)
+if barstate.islast
+    if not isOneMinute
+        table.cell(warning, 0, 0, "MNQ 9:29: use a 1-minute chart", bgcolor = color.red, text_color = color.white)
+    else
+        table.cell(warning, 0, 0, "", bgcolor = color.new(color.black, 100))

@@ -1,0 +1,1191 @@
+//@version=6
+// stocks-levels v2.0.0-zones — sandbox for major-liquidity zone styles
+// Path: indicators/stocks-levels/scripts/v2/stocks_levels.pine
+//
+// Same as v1, plus a Zone Lab so we can A/B several ways of drawing
+// PD / PM / week / month / after-hours as bands instead of a single line.
+// v1 stays the published Line-only build.
+//
+//   PRICE LEVEL    21 levels, each: show / color / thickness / style
+//                  Pre-market H/L, Prev day H/L/Open/Close, Current day open,
+//                  Prev week H/L, Current week H/L, Prev month H/L,
+//                  1st candle H/L, 5 min H/L, 15 min H/L, After-hour H/L
+//   PRICE AXIS     per level: show value on the price scale
+//   LABEL          per level: on, "display price", text, size, text color, transparent, offset from last bar
+//   NO ALERT PERIOD  mute level-cross alerts inside a session (alerts use alert(), 0 plot counts)
+//   NEWS TIME LINE vertical line at HH:MM ET each shown day
+//   DAILY GAP      box from prior RTH close to today's RTH open, border thickness / color / style, fill
+//   A+ TRADE CHECKLIST  table: Index trend, each level or range Above / Inside / Below, VWAP, MA, ADX, RVOL
+//   MAJOR ZONES    PD / PM / week / month / after-hours can draw as Line or Zone (cream band)
+//   EXTRA          Session VWAP + up to 8 EMAs
+//
+// "Show Levels on": Last Day draws levels and gap only for the chart's most recent trading day.
+// All Days draws each day's own levels. Daily levels are plot() series inside the levels window
+// (default 04:00-16:00 ET) so they scroll and zoom with price. Labels sit N bars right of the last bar,
+// joined to the last bar by a short connector line in the level's color.
+//
+// Plot budget (RE10140 limit 64): plot() with input color = 2, line/label/box/table/alert() = 0.
+//   23 levels x2 = 46, VWAP 1 x2 = 2, EMAs 8 x2 = 16  ->  64 of 64 (budget is full).
+//   To add another plotted level, drop an EMA slot or give something a constant color.
+
+indicator("Stocks Levels — Zone Lab", shorttitle = "SLV-Z", overlay = true,
+     max_lines_count = 200, max_labels_count = 100, max_boxes_count = 500)
+
+// =========================================================================
+// CONSTANTS
+// =========================================================================
+DISP_NOAXIS = display.pane + display.status_line + display.data_window
+string STY_OPTS_0 = "solid (—)"
+string STY_OPTS_1 = "dashed (- -)"
+string STY_OPTS_2 = "dotted (...)"
+
+// =========================================================================
+// INPUTS — Price Level
+// =========================================================================
+string G_LVL = "Price Level"
+string levelsMode = input.string("Last Day", "Show Levels on", options = ["All Days", "Last Day"], group = G_LVL, display = display.none,
+     tooltip = "Last Day: levels, gap and news line only for the chart's most recent trading day. All Days: every day shows its own.")
+string tz = input.string("America/New_York", "Timezone", group = G_LVL, display = display.none)
+string levelSession = input.session("0400-1600", "Levels window (ET)", group = G_LVL, display = display.none,
+     tooltip = "Daily levels start at the window open. On the chart's latest day they continue through after-hours to the current bar; on earlier days (All Days mode) they stop at the window close.")
+string pmSession = input.session("0400-0930", "Pre-market session", group = G_LVL, display = display.none)
+string ahSession = input.session("1600-2000", "After-hours session", group = G_LVL, display = display.none)
+
+bool   shPmh = input.bool(true, "Pre-market high", group = G_LVL, inline = "pmh")
+color  coPmh = input.color(#42a5f5, "", group = G_LVL, inline = "pmh")
+int    wdPmh = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pmh", display = display.none)
+string stPmh = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pmh", display = display.none)
+bool   znPmh = input.bool(false, "", group = G_LVL, inline = "pmh", tooltip = "Zone — solid band for this level")
+
+bool   shPml = input.bool(true, "Pre-market low", group = G_LVL, inline = "pml")
+color  coPml = input.color(#42a5f5, "", group = G_LVL, inline = "pml")
+int    wdPml = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pml", display = display.none)
+string stPml = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pml", display = display.none)
+bool   znPml = input.bool(false, "", group = G_LVL, inline = "pml", tooltip = "Zone — solid band for this level")
+
+bool   shPdh = input.bool(true, "Prev day high", group = G_LVL, inline = "pdh")
+color  coPdh = input.color(#f5c518, "", group = G_LVL, inline = "pdh")
+int    wdPdh = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pdh", display = display.none)
+string stPdh = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pdh", display = display.none)
+bool   znPdh = input.bool(false, "", group = G_LVL, inline = "pdh", tooltip = "Zone — solid band for this level")
+
+bool   shPdl = input.bool(true, "Prev day low", group = G_LVL, inline = "pdl")
+color  coPdl = input.color(#f5c518, "", group = G_LVL, inline = "pdl")
+int    wdPdl = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pdl", display = display.none)
+string stPdl = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pdl", display = display.none)
+bool   znPdl = input.bool(false, "", group = G_LVL, inline = "pdl", tooltip = "Zone — solid band for this level")
+
+bool   shPdo = input.bool(false, "Prev day open", group = G_LVL, inline = "pdo")
+color  coPdo = input.color(#9e9e9e, "", group = G_LVL, inline = "pdo")
+int    wdPdo = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "pdo", display = display.none)
+string stPdo = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pdo", display = display.none)
+bool   znPdo = input.bool(false, "", group = G_LVL, inline = "pdo", tooltip = "Zone — solid band for this level")
+
+bool   shPdc = input.bool(false, "Prev day close", group = G_LVL, inline = "pdc")
+color  coPdc = input.color(#ff5722, "", group = G_LVL, inline = "pdc")
+int    wdPdc = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "pdc", display = display.none)
+string stPdc = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pdc", display = display.none)
+bool   znPdc = input.bool(false, "", group = G_LVL, inline = "pdc", tooltip = "Zone — solid band for this level")
+
+bool   shCdo = input.bool(false, "Current day open", group = G_LVL, inline = "cdo")
+color  coCdo = input.color(#ffffff, "", group = G_LVL, inline = "cdo")
+int    wdCdo = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "cdo", display = display.none)
+string stCdo = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "cdo", display = display.none)
+bool   znCdo = input.bool(false, "", group = G_LVL, inline = "cdo", tooltip = "Zone — solid band for this level")
+
+bool   shCdh = input.bool(true, "Current day high", group = G_LVL, inline = "cdh")
+color  coCdh = input.color(#4caf50, "", group = G_LVL, inline = "cdh")
+int    wdCdh = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "cdh", display = display.none)
+string stCdh = input.string(STY_OPTS_1, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "cdh", display = display.none)
+bool   znCdh = input.bool(false, "", group = G_LVL, inline = "cdh", tooltip = "Zone — solid band for this level")
+
+bool   shCdl = input.bool(true, "Current day low", group = G_LVL, inline = "cdl")
+color  coCdl = input.color(#4caf50, "", group = G_LVL, inline = "cdl")
+int    wdCdl = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "cdl", display = display.none)
+string stCdl = input.string(STY_OPTS_1, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "cdl", display = display.none)
+bool   znCdl = input.bool(false, "", group = G_LVL, inline = "cdl", tooltip = "Zone — solid band for this level")
+string cdSessionMode = input.string("RTH only", "Current day H/L session", options = ["RTH only", "Premarket + RTH"], group = G_LVL, display = display.none,
+     tooltip = "Which bars feed the live current-day (intraday) high / low.")
+
+bool   shPwh = input.bool(true, "Prev week high", group = G_LVL, inline = "pwh")
+color  coPwh = input.color(#69f0ae, "", group = G_LVL, inline = "pwh")
+int    wdPwh = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pwh", display = display.none)
+string stPwh = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pwh", display = display.none)
+bool   znPwh = input.bool(false, "", group = G_LVL, inline = "pwh", tooltip = "Zone — solid band for this level")
+
+bool   shPwl = input.bool(true, "Prev week low", group = G_LVL, inline = "pwl")
+color  coPwl = input.color(#69f0ae, "", group = G_LVL, inline = "pwl")
+int    wdPwl = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pwl", display = display.none)
+string stPwl = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pwl", display = display.none)
+bool   znPwl = input.bool(false, "", group = G_LVL, inline = "pwl", tooltip = "Zone — solid band for this level")
+
+bool   shCwh = input.bool(false, "Current week high", group = G_LVL, inline = "cwh")
+color  coCwh = input.color(#f48fb1, "", group = G_LVL, inline = "cwh")
+int    wdCwh = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "cwh", display = display.none)
+string stCwh = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "cwh", display = display.none)
+bool   znCwh = input.bool(false, "", group = G_LVL, inline = "cwh", tooltip = "Zone — solid band for this level")
+
+bool   shCwl = input.bool(false, "Current week low", group = G_LVL, inline = "cwl")
+color  coCwl = input.color(#f48fb1, "", group = G_LVL, inline = "cwl")
+int    wdCwl = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "cwl", display = display.none)
+string stCwl = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "cwl", display = display.none)
+bool   znCwl = input.bool(false, "", group = G_LVL, inline = "cwl", tooltip = "Zone — solid band for this level")
+
+bool   shPmoh = input.bool(false, "Prev month high", group = G_LVL, inline = "pmoh")
+color  coPmoh = input.color(#66bb6a, "", group = G_LVL, inline = "pmoh")
+int    wdPmoh = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pmoh", display = display.none)
+string stPmoh = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pmoh", display = display.none)
+bool   znPmoh = input.bool(false, "", group = G_LVL, inline = "pmoh", tooltip = "Zone — solid band for this level")
+
+bool   shPmol = input.bool(false, "Prev month low", group = G_LVL, inline = "pmol")
+color  coPmol = input.color(#66bb6a, "", group = G_LVL, inline = "pmol")
+int    wdPmol = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "pmol", display = display.none)
+string stPmol = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "pmol", display = display.none)
+bool   znPmol = input.bool(false, "", group = G_LVL, inline = "pmol", tooltip = "Zone — solid band for this level")
+
+bool   shO1h = input.bool(true, "1st Candle High", group = G_LVL, inline = "o1h")
+color  coO1h = input.color(#ce93d8, "", group = G_LVL, inline = "o1h")
+int    wdO1h = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "o1h", display = display.none)
+string stO1h = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "o1h", display = display.none)
+bool   znO1h = input.bool(false, "", group = G_LVL, inline = "o1h", tooltip = "Zone — solid band for this level")
+
+bool   shO1l = input.bool(true, "1st Candle Low", group = G_LVL, inline = "o1l")
+color  coO1l = input.color(#ce93d8, "", group = G_LVL, inline = "o1l")
+int    wdO1l = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "o1l", display = display.none)
+string stO1l = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "o1l", display = display.none)
+bool   znO1l = input.bool(false, "", group = G_LVL, inline = "o1l", tooltip = "Zone — solid band for this level")
+
+bool   shO5h = input.bool(true, "5 min Candles High", group = G_LVL, inline = "o5h")
+color  coO5h = input.color(#ce93d8, "", group = G_LVL, inline = "o5h")
+int    wdO5h = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "o5h", display = display.none)
+string stO5h = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "o5h", display = display.none)
+bool   znO5h = input.bool(false, "", group = G_LVL, inline = "o5h", tooltip = "Zone — solid band for this level")
+
+bool   shO5l = input.bool(true, "5 min Candles Low", group = G_LVL, inline = "o5l")
+color  coO5l = input.color(#ce93d8, "", group = G_LVL, inline = "o5l")
+int    wdO5l = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "o5l", display = display.none)
+string stO5l = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "o5l", display = display.none)
+bool   znO5l = input.bool(false, "", group = G_LVL, inline = "o5l", tooltip = "Zone — solid band for this level")
+
+bool   shO15h = input.bool(false, "15 min Candles High", group = G_LVL, inline = "o15h")
+color  coO15h = input.color(#ce93d8, "", group = G_LVL, inline = "o15h")
+int    wdO15h = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "o15h", display = display.none)
+string stO15h = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "o15h", display = display.none)
+bool   znO15h = input.bool(false, "", group = G_LVL, inline = "o15h", tooltip = "Zone — solid band for this level")
+
+bool   shO15l = input.bool(false, "15 min Candles Low", group = G_LVL, inline = "o15l")
+color  coO15l = input.color(#ce93d8, "", group = G_LVL, inline = "o15l")
+int    wdO15l = input.int(2, "", minval = 1, maxval = 5, group = G_LVL, inline = "o15l", display = display.none)
+string stO15l = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "o15l", display = display.none)
+bool   znO15l = input.bool(false, "", group = G_LVL, inline = "o15l", tooltip = "Zone — solid band for this level")
+
+bool   shAhh = input.bool(false, "After-hour high", group = G_LVL, inline = "ahh")
+color  coAhh = input.color(#7c4dff, "", group = G_LVL, inline = "ahh")
+int    wdAhh = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "ahh", display = display.none)
+string stAhh = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "ahh", display = display.none)
+bool   znAhh = input.bool(false, "", group = G_LVL, inline = "ahh", tooltip = "Zone — solid band for this level")
+
+bool   shAhl = input.bool(false, "After-hour Low", group = G_LVL, inline = "ahl")
+color  coAhl = input.color(#7c4dff, "", group = G_LVL, inline = "ahl")
+int    wdAhl = input.int(1, "", minval = 1, maxval = 5, group = G_LVL, inline = "ahl", display = display.none)
+string stAhl = input.string(STY_OPTS_0, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_LVL, inline = "ahl", display = display.none)
+bool   znAhl = input.bool(false, "", group = G_LVL, inline = "ahl", tooltip = "Zone — solid band for this level")
+
+// =========================================================================
+// INPUTS — Price Axis (show the level's value on the price scale)
+// =========================================================================
+string G_AX = "Price Axis"
+bool axPmh  = input.bool(true,  "Pre-market high", group = G_AX)
+bool axPml  = input.bool(true,  "Pre-market low", group = G_AX)
+bool axPdh  = input.bool(true,  "Prev day high", group = G_AX)
+bool axPdl  = input.bool(true,  "Prev day low", group = G_AX)
+bool axPdo  = input.bool(false, "Prev day open", group = G_AX)
+bool axPdc  = input.bool(false, "Prev day close", group = G_AX)
+bool axCdo  = input.bool(false, "Current day open", group = G_AX)
+bool axCdh  = input.bool(false, "Current day high", group = G_AX)
+bool axCdl  = input.bool(false, "Current day low", group = G_AX)
+bool axPwh  = input.bool(true,  "Prev week high", group = G_AX)
+bool axPwl  = input.bool(true,  "Prev week low", group = G_AX)
+bool axCwh  = input.bool(false, "Current week high", group = G_AX)
+bool axCwl  = input.bool(false, "Current week low", group = G_AX)
+bool axPmoh = input.bool(false, "Prev month high", group = G_AX)
+bool axPmol = input.bool(false, "Prev month low", group = G_AX)
+bool axO1h  = input.bool(false, "1st Candle High", group = G_AX)
+bool axO1l  = input.bool(false, "1st Candle Low", group = G_AX)
+bool axO5h  = input.bool(false, "5 min Candles High", group = G_AX)
+bool axO5l  = input.bool(false, "5 min Candles Low", group = G_AX)
+bool axO15h = input.bool(false, "15 min Candles High", group = G_AX)
+bool axO15l = input.bool(false, "15 min Candles Low", group = G_AX)
+bool axAhh  = input.bool(false, "After-hour high", group = G_AX)
+bool axAhl  = input.bool(false, "After-hour Low", group = G_AX)
+
+// =========================================================================
+// INPUTS — Label (per level: on, price in label, text, size, text color, transparent, offset)
+// =========================================================================
+string G_LB = "Label"
+string SZ_T = "Tiny"
+string SZ_S = "Small"
+string SZ_N = "Normal"
+string SZ_L = "Large"
+
+bool   lbPmh  = input.bool(true, "Pre-market high", group = G_LB, inline = "l01")
+bool   lpPmh  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l01")
+string ltPmh  = input.string("PM High", "Text", group = G_LB, inline = "l01b", display = display.none)
+string lsPmh  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l01b", display = display.none)
+color  lcPmh  = input.color(#000000, "", group = G_LB, inline = "l01b")
+bool   lxPmh  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l01b")
+
+bool   lbPml  = input.bool(true, "Pre-market low", group = G_LB, inline = "l02")
+bool   lpPml  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l02")
+string ltPml  = input.string("PM Low", "Text", group = G_LB, inline = "l02b", display = display.none)
+string lsPml  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l02b", display = display.none)
+color  lcPml  = input.color(#000000, "", group = G_LB, inline = "l02b")
+bool   lxPml  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l02b")
+
+bool   lbPdh  = input.bool(true, "Prev day high", group = G_LB, inline = "l03")
+bool   lpPdh  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l03")
+string ltPdh  = input.string("PrevDay High", "Text", group = G_LB, inline = "l03b", display = display.none)
+string lsPdh  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l03b", display = display.none)
+color  lcPdh  = input.color(#000000, "", group = G_LB, inline = "l03b")
+bool   lxPdh  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l03b")
+
+bool   lbPdl  = input.bool(true, "Prev day low", group = G_LB, inline = "l04")
+bool   lpPdl  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l04")
+string ltPdl  = input.string("PrevDay Low", "Text", group = G_LB, inline = "l04b", display = display.none)
+string lsPdl  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l04b", display = display.none)
+color  lcPdl  = input.color(#000000, "", group = G_LB, inline = "l04b")
+bool   lxPdl  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l04b")
+
+bool   lbPdo  = input.bool(false, "Prev day open", group = G_LB, inline = "l05")
+bool   lpPdo  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l05")
+string ltPdo  = input.string("PrevDay Open", "Text", group = G_LB, inline = "l05b", display = display.none)
+string lsPdo  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l05b", display = display.none)
+color  lcPdo  = input.color(#000000, "", group = G_LB, inline = "l05b")
+bool   lxPdo  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l05b")
+
+bool   lbPdc  = input.bool(false, "Prev day close", group = G_LB, inline = "l06")
+bool   lpPdc  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l06")
+string ltPdc  = input.string("PrevDay Close", "Text", group = G_LB, inline = "l06b", display = display.none)
+string lsPdc  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l06b", display = display.none)
+color  lcPdc  = input.color(#000000, "", group = G_LB, inline = "l06b")
+bool   lxPdc  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l06b")
+
+bool   lbCdo  = input.bool(false, "Current open", group = G_LB, inline = "l07")
+bool   lpCdo  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l07")
+string ltCdo  = input.string("Open", "Text", group = G_LB, inline = "l07b", display = display.none)
+string lsCdo  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l07b", display = display.none)
+color  lcCdo  = input.color(#000000, "", group = G_LB, inline = "l07b")
+bool   lxCdo  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l07b")
+
+bool   lbCdh  = input.bool(true, "Current day high", group = G_LB, inline = "l07c")
+bool   lpCdh  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l07c")
+string ltCdh  = input.string("Day High", "Text", group = G_LB, inline = "l07d", display = display.none)
+string lsCdh  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l07d", display = display.none)
+color  lcCdh  = input.color(#000000, "", group = G_LB, inline = "l07d")
+bool   lxCdh  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l07d")
+
+bool   lbCdl  = input.bool(true, "Current day low", group = G_LB, inline = "l07e")
+bool   lpCdl  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l07e")
+string ltCdl  = input.string("Day Low", "Text", group = G_LB, inline = "l07f", display = display.none)
+string lsCdl  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l07f", display = display.none)
+color  lcCdl  = input.color(#000000, "", group = G_LB, inline = "l07f")
+bool   lxCdl  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l07f")
+
+bool   lbPwh  = input.bool(true, "Prev week high", group = G_LB, inline = "l08")
+bool   lpPwh  = input.bool(true, "", tooltip = "Second checkbox: display price in label", group = G_LB, inline = "l08")
+string ltPwh  = input.string("Prev week high", "Text", group = G_LB, inline = "l08b", display = display.none)
+string lsPwh  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l08b", display = display.none)
+color  lcPwh  = input.color(#000000, "", group = G_LB, inline = "l08b")
+bool   lxPwh  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l08b")
+
+bool   lbPwl  = input.bool(true, "Prev week low", group = G_LB, inline = "l09")
+bool   lpPwl  = input.bool(true, "", tooltip = "Second checkbox: display price in label", group = G_LB, inline = "l09")
+string ltPwl  = input.string("Prev week low", "Text", group = G_LB, inline = "l09b", display = display.none)
+string lsPwl  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l09b", display = display.none)
+color  lcPwl  = input.color(#000000, "", group = G_LB, inline = "l09b")
+bool   lxPwl  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l09b")
+
+bool   lbCwh  = input.bool(false, "Current week high", group = G_LB, inline = "l10")
+bool   lpCwh  = input.bool(true, "", tooltip = "Second checkbox: display price in label", group = G_LB, inline = "l10")
+string ltCwh  = input.string("Week high", "Text", group = G_LB, inline = "l10b", display = display.none)
+string lsCwh  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l10b", display = display.none)
+color  lcCwh  = input.color(#000000, "", group = G_LB, inline = "l10b")
+bool   lxCwh  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l10b")
+
+bool   lbCwl  = input.bool(false, "Current week low", group = G_LB, inline = "l11")
+bool   lpCwl  = input.bool(true, "", tooltip = "Second checkbox: display price in label", group = G_LB, inline = "l11")
+string ltCwl  = input.string("Week low", "Text", group = G_LB, inline = "l11b", display = display.none)
+string lsCwl  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l11b", display = display.none)
+color  lcCwl  = input.color(#000000, "", group = G_LB, inline = "l11b")
+bool   lxCwl  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l11b")
+
+bool   lbPmoh = input.bool(false, "Prev month high", group = G_LB, inline = "l12")
+bool   lpPmoh = input.bool(true, "", tooltip = "Second checkbox: display price in label", group = G_LB, inline = "l12")
+string ltPmoh = input.string("Prev month high", "Text", group = G_LB, inline = "l12b", display = display.none)
+string lsPmoh = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l12b", display = display.none)
+color  lcPmoh = input.color(#000000, "", group = G_LB, inline = "l12b")
+bool   lxPmoh = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l12b")
+
+bool   lbPmol = input.bool(false, "Prev month low", group = G_LB, inline = "l13")
+bool   lpPmol = input.bool(true, "", tooltip = "Second checkbox: display price in label", group = G_LB, inline = "l13")
+string ltPmol = input.string("Prev month low", "Text", group = G_LB, inline = "l13b", display = display.none)
+string lsPmol = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l13b", display = display.none)
+color  lcPmol = input.color(#000000, "", group = G_LB, inline = "l13b")
+bool   lxPmol = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l13b")
+
+bool   lbO1h  = input.bool(true, "1st Candle High", group = G_LB, inline = "l14")
+bool   lpO1h  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l14")
+string ltO1h  = input.string("1st Candle High", "Text", group = G_LB, inline = "l14b", display = display.none)
+string lsO1h  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l14b", display = display.none)
+color  lcO1h  = input.color(#000000, "", group = G_LB, inline = "l14b")
+bool   lxO1h  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l14b")
+
+bool   lbO1l  = input.bool(true, "1st Candle Low", group = G_LB, inline = "l15")
+bool   lpO1l  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l15")
+string ltO1l  = input.string("1st Candle Low", "Text", group = G_LB, inline = "l15b", display = display.none)
+string lsO1l  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l15b", display = display.none)
+color  lcO1l  = input.color(#000000, "", group = G_LB, inline = "l15b")
+bool   lxO1l  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l15b")
+
+bool   lbO5h  = input.bool(true, "5 min Candle High", group = G_LB, inline = "l16")
+bool   lpO5h  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l16")
+string ltO5h  = input.string("5 Min High", "Text", group = G_LB, inline = "l16b", display = display.none)
+string lsO5h  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l16b", display = display.none)
+color  lcO5h  = input.color(#000000, "", group = G_LB, inline = "l16b")
+bool   lxO5h  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l16b")
+
+bool   lbO5l  = input.bool(true, "5 min Candle Low", group = G_LB, inline = "l17")
+bool   lpO5l  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l17")
+string ltO5l  = input.string("5 Min Low", "Text", group = G_LB, inline = "l17b", display = display.none)
+string lsO5l  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l17b", display = display.none)
+color  lcO5l  = input.color(#000000, "", group = G_LB, inline = "l17b")
+bool   lxO5l  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l17b")
+
+bool   lbO15h = input.bool(false, "15 min Candle High", group = G_LB, inline = "l18")
+bool   lpO15h = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l18")
+string ltO15h = input.string("15 Min High", "Text", group = G_LB, inline = "l18b", display = display.none)
+string lsO15h = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l18b", display = display.none)
+color  lcO15h = input.color(#000000, "", group = G_LB, inline = "l18b")
+bool   lxO15h = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l18b")
+
+bool   lbO15l = input.bool(false, "15 min Candle Low", group = G_LB, inline = "l19")
+bool   lpO15l = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l19")
+string ltO15l = input.string("15 Min Low", "Text", group = G_LB, inline = "l19b", display = display.none)
+string lsO15l = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l19b", display = display.none)
+color  lcO15l = input.color(#000000, "", group = G_LB, inline = "l19b")
+bool   lxO15l = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l19b")
+
+bool   lbAhh  = input.bool(false, "After-hour high", group = G_LB, inline = "l20")
+bool   lpAhh  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l20")
+string ltAhh  = input.string("AM high", "Text", group = G_LB, inline = "l20b", display = display.none)
+string lsAhh  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l20b", display = display.none)
+color  lcAhh  = input.color(#000000, "", group = G_LB, inline = "l20b")
+bool   lxAhh  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l20b")
+
+bool   lbAhl  = input.bool(false, "After-hour Low", group = G_LB, inline = "l21")
+bool   lpAhl  = input.bool(true, "", tooltip = "Second checkbox: display price after label text", group = G_LB, inline = "l21")
+string ltAhl  = input.string("AM low", "Text", group = G_LB, inline = "l21b", display = display.none)
+string lsAhl  = input.string(SZ_N, "", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_LB, inline = "l21b", display = display.none)
+color  lcAhl  = input.color(#000000, "", group = G_LB, inline = "l21b")
+bool   lxAhl  = input.bool(false, "", tooltip = "Text · size · text color · transparent background", group = G_LB, inline = "l21b")
+
+int ofPmh  = input.int(10, "Pre-market high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPml  = input.int(10, "Pre-market low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPdh  = input.int(10, "Prev day high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPdl  = input.int(10, "Prev day low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPdo  = input.int(10, "Prev day open label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPdc  = input.int(10, "Prev day close label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofCdo  = input.int(10, "Current open label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofCdh  = input.int(10, "Current day high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofCdl  = input.int(10, "Current day low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPwh  = input.int(20, "Prev Week high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPwl  = input.int(20, "Prev Week low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofCwh  = input.int(20, "Current Week high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofCwl  = input.int(20, "Current Week Low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPmoh = input.int(20, "Prev Month high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofPmol = input.int(20, "Prev Month low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofO1h  = input.int(10, "1st Candle High label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofO1l  = input.int(10, "1st Candle Low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofO5h  = input.int(10, "5 min Candle High label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofO5l  = input.int(10, "5 min Candle Low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofO15h = input.int(10, "15 min Candle High label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofO15l = input.int(10, "15 min Candle Low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofAhh  = input.int(10, "After-hour high label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+int ofAhl  = input.int(10, "After-hour Low label offset from last bar", minval = 0, maxval = 200, group = G_LB, display = display.none)
+
+// =========================================================================
+// INPUTS — Zone Lab (v2 sandbox). ORB / opens / live H-L stay lines.
+// =========================================================================
+string G_ZONE = "Zone Lab (v2 — experiment)"
+string zoneStyle = input.string("Cream shelf", "Zone style",
+     options = ["Off (lines only)", "Cream shelf", "Level-colored halo", "Stop-side band", "Outline only"],
+     group = G_ZONE, display = display.none,
+     tooltip = "Applies only to levels whose Zone checkbox is on in Price Level. Cream shelf = muted beige band. Halo = that level's color. Stop-side = only above highs / below lows. Outline = empty box.")
+string zoneSpan = input.string("Session window", "Zone span",
+     options = ["Session window", "Day start", "Visible range"],
+     group = G_ZONE, display = display.none,
+     tooltip = "Session window = same span as the level line. Day start = from the first bar of the ET day. Visible range = left of the viewport to the last bar.")
+bool   zoneKeepLine = input.bool(true, "Keep the midline", group = G_ZONE,
+     tooltip = "Leave the colored plot line on while testing a zone style.")
+color  zoneCol = input.color(color.new(#d4b896, 50), "Cream / outline color", group = G_ZONE)
+int    zoneFillTransp = input.int(60, "Halo fill transparency", minval = 0, maxval = 95, group = G_ZONE, display = display.none)
+string zoneMethod = input.string("Percent", "Zone width", options = ["ATR", "Fixed $", "Percent", "Ticks"], group = G_ZONE, display = display.none)
+int    zoneAtrLen = input.int(14, "ATR length", minval = 1, group = G_ZONE, display = display.none)
+float  zoneAtrMult = input.float(0.50, "ATR multiplier", minval = 0.05, step = 0.05, group = G_ZONE, display = display.none)
+float  zoneFixed = input.float(1.00, "Fixed width ($)", minval = 0.01, step = 0.05, group = G_ZONE, display = display.none)
+float  zonePct = input.float(0.15, "Width % of price", minval = 0.01, step = 0.01, group = G_ZONE, display = display.none)
+int    zoneTicks = input.int(20, "Width in ticks", minval = 1, group = G_ZONE, display = display.none)
+float  zoneDailyMult = input.float(1.0, "Daily multiplier (PD / PM / AH)", minval = 0.1, step = 0.1, group = G_ZONE, display = display.none)
+float  zoneWeeklyMult = input.float(1.5, "Weekly multiplier", minval = 0.1, step = 0.1, group = G_ZONE, display = display.none)
+float  zoneMonthlyMult = input.float(2.0, "Monthly multiplier", minval = 0.1, step = 0.1, group = G_ZONE, display = display.none)
+
+// =========================================================================
+// INPUTS — Alerts / No alert period
+// =========================================================================
+string G_AL = "No Alert Period"
+bool alertsOn = input.bool(true, "Level cross alerts", group = G_AL,
+     tooltip = "Fires alert() when close crosses any shown level. Create a TradingView alert on this indicator with condition “Any alert() function call”.")
+bool noAlertOn = input.bool(false, "No alert period", group = G_AL, inline = "na")
+string noAlertSession = input.session("0930-0935", "", group = G_AL, inline = "na", display = display.none,
+     tooltip = "Level cross alerts are muted inside this window.")
+
+// =========================================================================
+// INPUTS — News time line
+// =========================================================================
+string G_NW = "News Time Line"
+bool   newsOn  = input.bool(false, "Show News Time Line", group = G_NW, inline = "nw")
+color  newsCol = input.color(#2962ff, "", group = G_NW, inline = "nw")
+int    newsW   = input.int(2, "", minval = 1, maxval = 5, group = G_NW, inline = "nw", display = display.none)
+string newsSty = input.string(STY_OPTS_1, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_NW, inline = "nw", display = display.none)
+int    newsHour = input.int(10, "Time  Hour (0-23) · Minutes (0-59)", minval = 0, maxval = 23, group = G_NW, inline = "nwt", display = display.none)
+int    newsMin  = input.int(0, "", minval = 0, maxval = 59, group = G_NW, inline = "nwt", display = display.none)
+
+// =========================================================================
+// INPUTS — Daily gap
+// =========================================================================
+string G_GAP = "Daily Gap"
+bool   gapOn     = input.bool(true, "Show Daily Gap", group = G_GAP, inline = "g1")
+int    gapW      = input.int(3, "", minval = 1, maxval = 5, group = G_GAP, inline = "g1", display = display.none, tooltip = "Border thickness")
+color  gapBorder = input.color(#787b86, "Border color · Fill color · Border style", group = G_GAP, inline = "g2")
+color  gapFill   = input.color(color.new(#787b86, 90), "", group = G_GAP, inline = "g2")
+string gapSty    = input.string(STY_OPTS_1, "", options = [STY_OPTS_0, STY_OPTS_1, STY_OPTS_2], group = G_GAP, inline = "g2", display = display.none)
+
+// =========================================================================
+// INPUTS — A+ Trade Checklist table
+// =========================================================================
+string G_TB = "A+ Trade Checklist"
+bool   tblOn   = input.bool(true, "Show A+ Trade CheckList Table", group = G_TB)
+string tblPos  = input.string("Middle Right", "Table Display position",
+     options = ["Top Left", "Top Center", "Top Right", "Middle Left", "Middle Center", "Middle Right", "Bottom Left", "Bottom Center", "Bottom Right"],
+     group = G_TB, display = display.none)
+color  tblText   = input.color(#ffffff, "Text · Background · Frame · Border", group = G_TB, inline = "tc")
+color  tblBg     = input.color(#434651, "", group = G_TB, inline = "tc")
+color  tblFrame  = input.color(color.new(#000000, 100), "", group = G_TB, inline = "tc")
+color  tblBorder = input.color(color.new(#000000, 100), "", group = G_TB, inline = "tc")
+color  upCol  = input.color(#26a641, "Up Color", group = G_TB)
+color  dnCol  = input.color(#f23645, "Down Color", group = G_TB)
+string tblSize = input.string(SZ_N, "Text Size", options = [SZ_T, SZ_S, SZ_N, SZ_L], group = G_TB, display = display.none)
+string indexSym = input.string("QQQ", "Market measuring Index", options = ["QQQ", "SPY"], group = G_TB, display = display.none)
+string aboveTxt  = input.string("Above", "When Price Above Levels", group = G_TB, display = display.none)
+string insideTxt = input.string("Inside", "When Price between Levels", group = G_TB, display = display.none)
+string belowTxt  = input.string("Below", "When Price Below Levels", group = G_TB, display = display.none)
+
+// =========================================================================
+// INPUTS — A+ Trade Checklist levels (rows)
+// =========================================================================
+string G_CK = "A+ Trade Checklist Levels"
+bool ckIdx   = input.bool(true,  "Index Trend (SPY/QQQ)", group = G_CK)
+bool ckPd    = input.bool(true,  "Prev Day", group = G_CK)
+bool ckPdh   = input.bool(false, "Prev day high", group = G_CK)
+bool ckPdl   = input.bool(false, "Prev day low", group = G_CK)
+bool ckPm    = input.bool(true,  "Pre-market", group = G_CK)
+bool ckPmh   = input.bool(false, "Pre-market high", group = G_CK)
+bool ckPml   = input.bool(false, "Pre-market low", group = G_CK)
+bool ckPdo   = input.bool(false, "Prev day open", group = G_CK)
+bool ckPdc   = input.bool(false, "Prev day close", group = G_CK)
+bool ckCdo   = input.bool(false, "Current day open", group = G_CK)
+bool ckPw    = input.bool(true,  "Prev Week", group = G_CK)
+bool ckPwh   = input.bool(false, "Prev week high", group = G_CK)
+bool ckPwl   = input.bool(false, "Prev week low", group = G_CK)
+bool ckCw    = input.bool(false, "Current Week", group = G_CK)
+bool ckCwh   = input.bool(false, "Current week high", group = G_CK)
+bool ckCwl   = input.bool(false, "Current week low", group = G_CK)
+bool ckPmo   = input.bool(false, "Prev Month", group = G_CK)
+bool ckPmoh  = input.bool(false, "Prev month high", group = G_CK)
+bool ckPmol  = input.bool(false, "Prev month low", group = G_CK)
+bool ckO1    = input.bool(false, "1st Candle", group = G_CK)
+bool ckO1h   = input.bool(false, "1st Candle High", group = G_CK)
+bool ckO1l   = input.bool(false, "1st Candle Low", group = G_CK)
+bool ckO5    = input.bool(true,  "5 min Candles", group = G_CK)
+bool ckO5h   = input.bool(false, "5 min Candles High", group = G_CK)
+bool ckO5l   = input.bool(false, "5 min Candles Low", group = G_CK)
+bool ckO15   = input.bool(false, "15 min Candles", group = G_CK)
+bool ckO15h  = input.bool(false, "15 min Candles High", group = G_CK)
+bool ckO15l  = input.bool(false, "15 min Candles Low", group = G_CK)
+bool ckAhh   = input.bool(false, "After-hour high", group = G_CK)
+bool ckAhl   = input.bool(false, "After-hour Low", group = G_CK)
+bool ckVwap  = input.bool(true,  "VWAP", group = G_CK)
+bool ckMa    = input.bool(true,  "Moving Average", group = G_CK)
+string maType = input.string("EMA", "Moving Avg. Type · Length", options = ["EMA", "SMA", "WMA", "VWMA", "HMA"], group = G_CK, inline = "ma", display = display.none)
+int    maLen  = input.int(9, "", minval = 1, group = G_CK, inline = "ma", display = display.none)
+string maTf   = input.string("Chart", "Moving Avg. Time Frame", options = ["Chart", "1", "3", "5", "15", "30", "60", "120", "240", "D", "W"], group = G_CK, display = display.none)
+bool  ckAdx   = input.bool(false, "ADX", group = G_CK)
+float adxThr  = input.float(25, "ADX Greater Than · Time Frame", minval = 1, group = G_CK, inline = "adx", display = display.none)
+string adxTf  = input.string("Chart", "", options = ["Chart", "1", "3", "5", "15", "30", "60", "120", "240", "D", "W"], group = G_CK, inline = "adx", display = display.none)
+int adxSmooth = input.int(14, "ADX Smoothing · DI Length", minval = 1, group = G_CK, inline = "adx2", display = display.none)
+int diLen     = input.int(14, "", minval = 1, group = G_CK, inline = "adx2", display = display.none)
+bool  ckRvol  = input.bool(false, "RVOL", group = G_CK)
+int   rvolLen = input.int(14, "Volume Average Length", minval = 2, group = G_CK, display = display.none)
+float rvolThr = input.float(2, "RVOL Threshold", minval = 0.1, step = 0.1, group = G_CK, display = display.none)
+
+// =========================================================================
+// INPUTS — VWAP (extra)
+// =========================================================================
+string G_VW = "VWAP"
+bool   showVwap = input.bool(true, "Show VWAP", group = G_VW, inline = "vw")
+color  colVwap  = input.color(#ef5350, "", group = G_VW, inline = "vw")
+int    wVwap    = input.int(2, "", minval = 1, maxval = 4, group = G_VW, inline = "vw", display = display.none)
+string vwapAnchor = input.string("Session (incl. premarket)", "VWAP anchor", options = ["Session (incl. premarket)", "RTH open"], group = G_VW, display = display.none)
+
+// =========================================================================
+// INPUTS — EMAs (extra, up to 8)
+// =========================================================================
+string G_EMA = "EMAs"
+bool  showEma1 = input.bool(true, "EMA 1", group = G_EMA, inline = "e1")
+int   lenEma1  = input.int(9, "", minval = 1, group = G_EMA, inline = "e1", display = display.none)
+color colEma1  = input.color(#26a69a, "", group = G_EMA, inline = "e1")
+int   wEma1    = input.int(2, "", minval = 1, maxval = 4, group = G_EMA, inline = "e1", display = display.none)
+
+bool  showEma2 = input.bool(true, "EMA 2", group = G_EMA, inline = "e2")
+int   lenEma2  = input.int(20, "", minval = 1, group = G_EMA, inline = "e2", display = display.none)
+color colEma2  = input.color(#ff9800, "", group = G_EMA, inline = "e2")
+int   wEma2    = input.int(2, "", minval = 1, maxval = 4, group = G_EMA, inline = "e2", display = display.none)
+
+bool  showEma3 = input.bool(true, "EMA 3", group = G_EMA, inline = "e3")
+int   lenEma3  = input.int(50, "", minval = 1, group = G_EMA, inline = "e3", display = display.none)
+color colEma3  = input.color(#ffeb3b, "", group = G_EMA, inline = "e3")
+int   wEma3    = input.int(2, "", minval = 1, maxval = 4, group = G_EMA, inline = "e3", display = display.none)
+
+bool  showEma4 = input.bool(false, "EMA 4", group = G_EMA, inline = "e4")
+int   lenEma4  = input.int(100, "", minval = 1, group = G_EMA, inline = "e4", display = display.none)
+color colEma4  = input.color(#9c27b0, "", group = G_EMA, inline = "e4")
+int   wEma4    = input.int(1, "", minval = 1, maxval = 4, group = G_EMA, inline = "e4", display = display.none)
+
+bool  showEma5 = input.bool(false, "EMA 5", group = G_EMA, inline = "e5")
+int   lenEma5  = input.int(200, "", minval = 1, group = G_EMA, inline = "e5", display = display.none)
+color colEma5  = input.color(#607d8b, "", group = G_EMA, inline = "e5")
+int   wEma5    = input.int(1, "", minval = 1, maxval = 4, group = G_EMA, inline = "e5", display = display.none)
+
+bool  showEma6 = input.bool(false, "EMA 6", group = G_EMA, inline = "e6")
+int   lenEma6  = input.int(8, "", minval = 1, group = G_EMA, inline = "e6", display = display.none)
+color colEma6  = input.color(#00bcd4, "", group = G_EMA, inline = "e6")
+int   wEma6    = input.int(1, "", minval = 1, maxval = 4, group = G_EMA, inline = "e6", display = display.none)
+
+bool  showEma7 = input.bool(false, "EMA 7", group = G_EMA, inline = "e7")
+int   lenEma7  = input.int(13, "", minval = 1, group = G_EMA, inline = "e7", display = display.none)
+color colEma7  = input.color(#8bc34a, "", group = G_EMA, inline = "e7")
+int   wEma7    = input.int(1, "", minval = 1, maxval = 4, group = G_EMA, inline = "e7", display = display.none)
+
+bool  showEma8 = input.bool(false, "EMA 8", group = G_EMA, inline = "e8")
+int   lenEma8  = input.int(34, "", minval = 1, group = G_EMA, inline = "e8", display = display.none)
+color colEma8  = input.color(#ffc107, "", group = G_EMA, inline = "e8")
+int   wEma8    = input.int(1, "", minval = 1, maxval = 4, group = G_EMA, inline = "e8", display = display.none)
+
+// =========================================================================
+// HELPERS
+// =========================================================================
+f_ls(s) =>
+    s == STY_OPTS_1 ? plot.linestyle_dashed : s == STY_OPTS_2 ? plot.linestyle_dotted : plot.linestyle_solid
+
+f_lineSty(s) =>
+    s == STY_OPTS_1 ? line.style_dashed : s == STY_OPTS_2 ? line.style_dotted : line.style_solid
+
+f_size(s) =>
+    s == SZ_T ? size.tiny : s == SZ_S ? size.small : s == SZ_L ? size.large : size.normal
+
+f_pos(s) =>
+    s == "Top Left" ? position.top_left : s == "Top Center" ? position.top_center : s == "Top Right" ? position.top_right :
+     s == "Middle Left" ? position.middle_left : s == "Middle Center" ? position.middle_center :
+     s == "Bottom Left" ? position.bottom_left : s == "Bottom Center" ? position.bottom_center : s == "Bottom Right" ? position.bottom_right :
+     position.middle_right
+
+// All MA types computed every bar, then one picked, so no ta.* call sits inside a branch (CW10003).
+f_ma(src, t, len) =>
+    float s = ta.sma(src, len)
+    float e = ta.ema(src, len)
+    float w = ta.wma(src, len)
+    float v = ta.vwma(src, len)
+    float h = ta.hma(src, len)
+    t == "SMA" ? s : t == "WMA" ? w : t == "VWMA" ? v : t == "HMA" ? h : e
+
+// Prior RTH day high / low, evaluated in the requested symbol's context (index trend row).
+f_prevDayRange() =>
+    bool rth = not na(time(timeframe.period, "0930-1600:23456", tz))
+    int d = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+    int dPrev = year(time[1], tz) * 10000 + month(time[1], tz) * 100 + dayofmonth(time[1], tz)
+    bool nd = na(time[1]) or d != dPrev
+    var float sH = na
+    var float sL = na
+    var float pH = na
+    var float pL = na
+    if nd
+        if not na(sH)
+            pH := sH
+            pL := sL
+        sH := na
+        sL := na
+    if rth
+        sH := na(sH) ? high : math.max(sH, high)
+        sL := na(sL) ? low : math.min(sL, low)
+    [close, pH, pL]
+
+// Label N bars right of the last bar + connector line from the last bar to the label, in the level's color.
+f_label(show, price, col, w, sty, lblOn, lblPrice, txt, sz, txtCol, transp, off) =>
+    var label lb = na
+    var line ln = na
+    bool on = show and lblOn and barstate.islast and not na(price)
+    bool lnOn = on and off > 0
+    int x2 = bar_index + off
+    string t = txt + (lblPrice ? " " + str.tostring(price, format.mintick) : "")
+    color bg = transp ? color.new(col, 100) : col
+    if on and na(lb)
+        lb := label.new(x2, price, t, xloc.bar_index, yloc.price, bg, label.style_label_left, txtCol, f_size(sz))
+    if on and not na(lb)
+        label.set_xy(lb, x2, price)
+        label.set_text(lb, t)
+        label.set_color(lb, bg)
+        label.set_textcolor(lb, txtCol)
+        label.set_size(lb, f_size(sz))
+    if not on and not na(lb)
+        label.delete(lb)
+        lb := na
+    if lnOn and na(ln)
+        ln := line.new(bar_index, price, x2, price, xloc.bar_index, extend.none, col, f_lineSty(sty), w)
+    if lnOn and not na(ln)
+        line.set_xy1(ln, bar_index, price)
+        line.set_xy2(ln, x2, price)
+        line.set_color(ln, col)
+        line.set_style(ln, f_lineSty(sty))
+        line.set_width(ln, w)
+    if not lnOn and not na(ln)
+        line.delete(ln)
+        ln := na
+
+// Cross message for alerts. Empty string when nothing crossed.
+f_cross(show, price, name) =>
+    bool crossed = show and not na(price) and not na(close[1]) and ((close[1] <= price and close > price) or (close[1] >= price and close < price))
+    crossed ? name + " " + str.tostring(price, format.mintick) + " | " : ""
+
+// Checklist status helpers.
+f_rangeStatus(hi, lo) =>
+    bool ok = not na(hi) and not na(lo)
+    string s = not ok ? "—" : close > hi ? aboveTxt : close < lo ? belowTxt : insideTxt
+    color c = not ok ? tblText : close > hi ? upCol : close < lo ? dnCol : tblText
+    [s, c]
+
+f_lvlStatus(p) =>
+    bool ok = not na(p)
+    string s = not ok ? "—" : close > p ? aboveTxt : belowTxt
+    color c = not ok ? tblText : close > p ? upCol : dnCol
+    [s, c]
+
+f_row(tbl, row, name, s, c) =>
+    table.cell(tbl, 0, row, name, text_color = tblText, text_size = f_size(tblSize), text_halign = text.align_left)
+    table.cell(tbl, 1, row, s, text_color = c, text_size = f_size(tblSize), text_halign = text.align_center)
+    row + 1
+
+// =========================================================================
+// SESSION FLAGS
+// =========================================================================
+int  etDate     = year(time, tz) * 10000 + month(time, tz) * 100 + dayofmonth(time, tz)
+int  prevEtDate = year(time[1], tz) * 10000 + month(time[1], tz) * 100 + dayofmonth(time[1], tz)
+bool newDay     = na(time[1]) or etDate != prevEtDate
+bool isWeekday  = dayofweek(time, tz) >= dayofweek.monday and dayofweek(time, tz) <= dayofweek.friday
+int  weekId     = year(time, tz) * 100 + weekofyear(time, tz)
+int  prevWeekId = year(time[1], tz) * 100 + weekofyear(time[1], tz)
+bool newWeek    = na(time[1]) or weekId != prevWeekId
+int  monthId    = year(time, tz) * 100 + month(time, tz)
+int  prevMonthId = year(time[1], tz) * 100 + month(time[1], tz)
+bool newMonth   = na(time[1]) or monthId != prevMonthId
+int  lastEtDate = year(last_bar_time, tz) * 10000 + month(last_bar_time, tz) * 100 + dayofmonth(last_bar_time, tz)
+bool levelDay   = levelsMode == "All Days" or etDate == lastEtDate
+
+bool inPM    = isWeekday and not na(time(timeframe.period, pmSession + ":23456", tz))
+bool inRTH   = isWeekday and not na(time(timeframe.period, "0930-1600:23456", tz))
+bool inAH    = isWeekday and not na(time(timeframe.period, ahSession + ":23456", tz))
+bool inOrb1  = isWeekday and not na(time(timeframe.period, "0930-0931:23456", tz))
+bool inOrb5  = isWeekday and not na(time(timeframe.period, "0930-0935:23456", tz))
+bool inOrb15 = isWeekday and not na(time(timeframe.period, "0930-0945:23456", tz))
+bool inWin   = isWeekday and not na(time(timeframe.period, levelSession + ":23456", tz))
+bool winStart = inWin and not inWin[1]
+bool rthStart = inRTH and not inRTH[1]
+// True from the first bar of the levels window until midnight ET. On the chart's latest day the levels
+// keep drawing through after-hours up to the current bar, so the lines reach the labels.
+var bool winSeen = false
+var int dayStartTime = na
+var int winStartTime = na
+var int dayStartBar = na
+var int winStartBar = na
+if newDay
+    winSeen := false
+    dayStartTime := time
+    dayStartBar := bar_index
+    winStartTime := na
+    winStartBar := na
+if inWin
+    winSeen := true
+    if na(winStartTime)
+        winStartTime := time
+        winStartBar := bar_index
+if winStart
+    winStartTime := time
+    winStartBar := bar_index
+bool drawBar = inWin or (etDate == lastEtDate and winSeen)
+
+// =========================================================================
+// LEVEL ENGINE
+// =========================================================================
+var float pdh = na
+var float pdl = na
+var float pdo = na
+var float pdc = na
+var float cdo = na
+var float cdH = na
+var float cdL = na
+var float pmH = na
+var float pmL = na
+var float ahH = na
+var float ahL = na
+var float ahCurH = na
+var float ahCurL = na
+var float pwh = na
+var float pwl = na
+var float cwH = na
+var float cwL = na
+var float pmoH = na
+var float pmoL = na
+var float monH = na
+var float monL = na
+var float o1H = na
+var float o1L = na
+var float o5H = na
+var float o5L = na
+var float o15H = na
+var float o15L = na
+var float sessH = na
+var float sessL = na
+var float sessO = na
+var float lastRthClose = na
+
+if newDay
+    if not na(sessH)
+        pdh := sessH
+        pdl := sessL
+        pdo := sessO
+        pdc := lastRthClose
+    if not na(ahCurH)
+        ahH := ahCurH
+        ahL := ahCurL
+    sessH := na
+    sessL := na
+    sessO := na
+    lastRthClose := na
+    cdo := na
+    cdH := na
+    cdL := na
+    pmH := na
+    pmL := na
+    ahCurH := na
+    ahCurL := na
+    o1H := na
+    o1L := na
+    o5H := na
+    o5L := na
+    o15H := na
+    o15L := na
+
+if newWeek
+    if not na(cwH)
+        pwh := cwH
+        pwl := cwL
+    cwH := na
+    cwL := na
+
+if newMonth
+    if not na(monH)
+        pmoH := monH
+        pmoL := monL
+    monH := na
+    monL := na
+
+if inPM
+    pmH := na(pmH) ? high : math.max(pmH, high)
+    pmL := na(pmL) ? low  : math.min(pmL, low)
+
+if rthStart
+    cdo := open
+    sessO := open
+
+if inRTH
+    sessH := na(sessH) ? high : math.max(sessH, high)
+    sessL := na(sessL) ? low  : math.min(sessL, low)
+    lastRthClose := close
+    cwH := na(cwH) ? high : math.max(cwH, high)
+    cwL := na(cwL) ? low  : math.min(cwL, low)
+    monH := na(monH) ? high : math.max(monH, high)
+    monL := na(monL) ? low  : math.min(monL, low)
+
+if inAH
+    ahCurH := na(ahCurH) ? high : math.max(ahCurH, high)
+    ahCurL := na(ahCurL) ? low  : math.min(ahCurL, low)
+
+// Live current-day (intraday) high / low
+bool trackCd = cdSessionMode == "RTH only" ? inRTH : (inPM or inRTH)
+if trackCd
+    cdH := na(cdH) ? high : math.max(cdH, high)
+    cdL := na(cdL) ? low  : math.min(cdL, low)
+
+if inOrb1
+    o1H := na(o1H) ? high : math.max(o1H, high)
+    o1L := na(o1L) ? low  : math.min(o1L, low)
+if inOrb5
+    o5H := na(o5H) ? high : math.max(o5H, high)
+    o5L := na(o5L) ? low  : math.min(o5L, low)
+if inOrb15
+    o15H := na(o15H) ? high : math.max(o15H, high)
+    o15L := na(o15L) ? low  : math.min(o15L, low)
+
+// =========================================================================
+// VWAP
+// =========================================================================
+bool vwapReset = vwapAnchor == "RTH open" ? rthStart : newDay
+var float vwapSumPV = na
+var float vwapSumV = na
+if vwapReset
+    vwapSumPV := hlc3 * volume
+    vwapSumV := volume
+else if (vwapAnchor == "RTH open" and inRTH) or (vwapAnchor != "RTH open" and (inPM or inRTH))
+    vwapSumPV += hlc3 * volume
+    vwapSumV += volume
+float vwapVal = vwapSumV > 0 ? vwapSumPV / vwapSumV : na
+
+// =========================================================================
+// CHECKLIST DATA (requests at global scope)
+// =========================================================================
+string maTfStr  = maTf == "Chart" ? timeframe.period : maTf
+string adxTfStr = adxTf == "Chart" ? timeframe.period : adxTf
+float maVal = request.security(syminfo.tickerid, maTfStr, f_ma(close, maType, maLen), lookahead = barmerge.lookahead_off)
+[diPlus, diMinus, adxVal] = request.security(syminfo.tickerid, adxTfStr, ta.dmi(diLen, adxSmooth), lookahead = barmerge.lookahead_off)
+[idxClose, idxPdh, idxPdl] = request.security(ticker.modify(indexSym, session = session.extended), timeframe.period, f_prevDayRange(),
+     lookahead = barmerge.lookahead_off, ignore_invalid_symbol = true)
+float volAvg = ta.sma(volume, rvolLen)
+float rvol = volAvg > 0 ? volume / volAvg : na
+
+// =========================================================================
+// ZONE LAB
+// The Price Level "Zone" checkbox is the on/off. Style "Off" still draws a
+// cream shelf so a checked box always produces a visible band.
+// Boxes are created/updated on the last bar so they appear even if the
+// session already started when the script was added (replay, midday add).
+// =========================================================================
+string zoneLook = zoneStyle == "Off (lines only)" ? "Cream shelf" : zoneStyle
+bool  hideMajorLine = not zoneKeepLine
+float zoneAtr = ta.atr(zoneAtrLen)
+float zoneHalfRaw =
+     zoneMethod == "Fixed $" ? zoneFixed / 2.0 :
+     zoneMethod == "Percent" ? close * zonePct / 100.0 / 2.0 :
+     zoneMethod == "Ticks" ? syminfo.mintick * zoneTicks / 2.0 :
+     not na(zoneAtr) ? zoneAtr * zoneAtrMult / 2.0 : na
+// Floor so a 1-minute ATR band is not thinner than the line (was the "no zone" look).
+float zoneHalfBase = not na(zoneHalfRaw) ? math.max(zoneHalfRaw, close * 0.0004) : na
+
+f_zone(show, price, lvlCol, mult, isHigh) =>
+    var box bx = na
+    float half = not na(zoneHalfBase) ? zoneHalfBase * mult : na
+    bool ready = show and not na(price) and not na(half) and half > 0
+    float top = zoneLook == "Stop-side band" ? (isHigh ? price + half * 2.0 : price) : price + half
+    float bot = zoneLook == "Stop-side band" ? (isHigh ? price : price - half * 2.0) : price - half
+    color fillC = zoneLook == "Cream shelf" ? zoneCol : zoneLook == "Outline only" ? color.new(lvlCol, 100) : color.new(lvlCol, zoneFillTransp)
+    color brdC = zoneLook == "Outline only" ? zoneCol : color.new(#8d6e4a, 40)
+    int brdW = zoneLook == "Outline only" ? 2 : 1
+    int x1b = zoneSpan == "Day start" ? nz(dayStartBar, bar_index) : nz(winStartBar, nz(dayStartBar, bar_index))
+    int x2b = bar_index
+    if not ready and not na(bx)
+        box.delete(bx)
+        bx := na
+    if ready and barstate.islast
+        if zoneSpan == "Visible range"
+            int x1t = nz(chart.left_visible_bar_time, time)
+            int x2t = time
+            if na(bx)
+                bx := box.new(x1t, top, x2t, bot, brdC, brdW, line.style_solid, extend.none, xloc.bar_time, fillC)
+            if not na(bx)
+                box.set_left(bx, x1t)
+                box.set_right(bx, x2t)
+                box.set_top(bx, top)
+                box.set_bottom(bx, bot)
+                box.set_bgcolor(bx, fillC)
+                box.set_border_color(bx, brdC)
+                box.set_border_width(bx, brdW)
+        else
+            if na(bx)
+                bx := box.new(x1b, top, x2b, bot, brdC, brdW, line.style_solid, extend.none, xloc.bar_index, fillC)
+            if not na(bx)
+                box.set_left(bx, x1b)
+                box.set_right(bx, x2b)
+                box.set_top(bx, top)
+                box.set_bottom(bx, bot)
+                box.set_bgcolor(bx, fillC)
+                box.set_border_color(bx, brdC)
+                box.set_border_width(bx, brdW)
+
+// =========================================================================
+// PLOTS — VWAP + EMAs (on the bars)
+// =========================================================================
+plot(showVwap ? vwapVal : na, "VWAP", color = colVwap, linewidth = wVwap)
+plot(showEma1 ? ta.ema(close, lenEma1) : na, "EMA 1", color = colEma1, linewidth = wEma1)
+plot(showEma2 ? ta.ema(close, lenEma2) : na, "EMA 2", color = colEma2, linewidth = wEma2)
+plot(showEma3 ? ta.ema(close, lenEma3) : na, "EMA 3", color = colEma3, linewidth = wEma3)
+plot(showEma4 ? ta.ema(close, lenEma4) : na, "EMA 4", color = colEma4, linewidth = wEma4)
+plot(showEma5 ? ta.ema(close, lenEma5) : na, "EMA 5", color = colEma5, linewidth = wEma5)
+plot(showEma6 ? ta.ema(close, lenEma6) : na, "EMA 6", color = colEma6, linewidth = wEma6)
+plot(showEma7 ? ta.ema(close, lenEma7) : na, "EMA 7", color = colEma7, linewidth = wEma7)
+plot(showEma8 ? ta.ema(close, lenEma8) : na, "EMA 8", color = colEma8, linewidth = wEma8)
+
+// =========================================================================
+// PLOTS — LEVELS (on the bars, inside the window, on the selected day(s))
+// The last bar always carries the value so the price-axis label stays visible after the window closes.
+// =========================================================================
+f_on(show, p, hideLine) =>
+    show and levelDay and not na(p) and (drawBar or barstate.islast) and not hideLine ? p : na
+
+plot(f_on(shPmh, pmH, hideMajorLine and znPmh),   "Pre-market high",     coPmh,  wdPmh,  plot.style_linebr, linestyle = f_ls(stPmh),  display = axPmh  ? display.all : DISP_NOAXIS)
+plot(f_on(shPml, pmL, hideMajorLine and znPml),   "Pre-market low",      coPml,  wdPml,  plot.style_linebr, linestyle = f_ls(stPml),  display = axPml  ? display.all : DISP_NOAXIS)
+plot(f_on(shPdh, pdh, hideMajorLine and znPdh),   "Prev day high",       coPdh,  wdPdh,  plot.style_linebr, linestyle = f_ls(stPdh),  display = axPdh  ? display.all : DISP_NOAXIS)
+plot(f_on(shPdl, pdl, hideMajorLine and znPdl),   "Prev day low",        coPdl,  wdPdl,  plot.style_linebr, linestyle = f_ls(stPdl),  display = axPdl  ? display.all : DISP_NOAXIS)
+plot(f_on(shPdo, pdo, hideMajorLine and znPdo),   "Prev day open",       coPdo,  wdPdo,  plot.style_linebr, linestyle = f_ls(stPdo),  display = axPdo  ? display.all : DISP_NOAXIS)
+plot(f_on(shPdc, pdc, hideMajorLine and znPdc),   "Prev day close",      coPdc,  wdPdc,  plot.style_linebr, linestyle = f_ls(stPdc),  display = axPdc  ? display.all : DISP_NOAXIS)
+plot(f_on(shCdo, cdo, hideMajorLine and znCdo),   "Current day open",    coCdo,  wdCdo,  plot.style_linebr, linestyle = f_ls(stCdo),  display = axCdo  ? display.all : DISP_NOAXIS)
+plot(f_on(shCdh, cdH, hideMajorLine and znCdh),   "Current day high",    coCdh,  wdCdh,  plot.style_linebr, linestyle = f_ls(stCdh),  display = axCdh  ? display.all : DISP_NOAXIS)
+plot(f_on(shCdl, cdL, hideMajorLine and znCdl),   "Current day low",     coCdl,  wdCdl,  plot.style_linebr, linestyle = f_ls(stCdl),  display = axCdl  ? display.all : DISP_NOAXIS)
+plot(f_on(shPwh, pwh, hideMajorLine and znPwh),   "Prev week high",      coPwh,  wdPwh,  plot.style_linebr, linestyle = f_ls(stPwh),  display = axPwh  ? display.all : DISP_NOAXIS)
+plot(f_on(shPwl, pwl, hideMajorLine and znPwl),   "Prev week low",       coPwl,  wdPwl,  plot.style_linebr, linestyle = f_ls(stPwl),  display = axPwl  ? display.all : DISP_NOAXIS)
+plot(f_on(shCwh, cwH, hideMajorLine and znCwh),   "Current week high",   coCwh,  wdCwh,  plot.style_linebr, linestyle = f_ls(stCwh),  display = axCwh  ? display.all : DISP_NOAXIS)
+plot(f_on(shCwl, cwL, hideMajorLine and znCwl),   "Current week low",    coCwl,  wdCwl,  plot.style_linebr, linestyle = f_ls(stCwl),  display = axCwl  ? display.all : DISP_NOAXIS)
+plot(f_on(shPmoh, pmoH, hideMajorLine and znPmoh), "Prev month high",     coPmoh, wdPmoh, plot.style_linebr, linestyle = f_ls(stPmoh), display = axPmoh ? display.all : DISP_NOAXIS)
+plot(f_on(shPmol, pmoL, hideMajorLine and znPmol), "Prev month low",      coPmol, wdPmol, plot.style_linebr, linestyle = f_ls(stPmol), display = axPmol ? display.all : DISP_NOAXIS)
+plot(f_on(shO1h, o1H, hideMajorLine and znO1h),   "1st Candle High",     coO1h,  wdO1h,  plot.style_linebr, linestyle = f_ls(stO1h),  display = axO1h  ? display.all : DISP_NOAXIS)
+plot(f_on(shO1l, o1L, hideMajorLine and znO1l),   "1st Candle Low",      coO1l,  wdO1l,  plot.style_linebr, linestyle = f_ls(stO1l),  display = axO1l  ? display.all : DISP_NOAXIS)
+plot(f_on(shO5h, o5H, hideMajorLine and znO5h),   "5 min Candles High",  coO5h,  wdO5h,  plot.style_linebr, linestyle = f_ls(stO5h),  display = axO5h  ? display.all : DISP_NOAXIS)
+plot(f_on(shO5l, o5L, hideMajorLine and znO5l),   "5 min Candles Low",   coO5l,  wdO5l,  plot.style_linebr, linestyle = f_ls(stO5l),  display = axO5l  ? display.all : DISP_NOAXIS)
+plot(f_on(shO15h, o15H, hideMajorLine and znO15h), "15 min Candles High", coO15h, wdO15h, plot.style_linebr, linestyle = f_ls(stO15h), display = axO15h ? display.all : DISP_NOAXIS)
+plot(f_on(shO15l, o15L, hideMajorLine and znO15l), "15 min Candles Low",  coO15l, wdO15l, plot.style_linebr, linestyle = f_ls(stO15l), display = axO15l ? display.all : DISP_NOAXIS)
+plot(f_on(shAhh, ahH, hideMajorLine and znAhh),   "After-hour high",     coAhh,  wdAhh,  plot.style_linebr, linestyle = f_ls(stAhh),  display = axAhh  ? display.all : DISP_NOAXIS)
+plot(f_on(shAhl, ahL, hideMajorLine and znAhl),   "After-hour Low",      coAhl,  wdAhl,  plot.style_linebr, linestyle = f_ls(stAhl),  display = axAhl  ? display.all : DISP_NOAXIS)
+
+// Per-level solid bands. Only levels with the Zone checkbox on are drawn.
+f_zone(shPmh and znPmh,   pmH,  coPmh,  zoneDailyMult,   true)
+f_zone(shPml and znPml,   pmL,  coPml,  zoneDailyMult,   false)
+f_zone(shPdh and znPdh,   pdh,  coPdh,  zoneDailyMult,   true)
+f_zone(shPdl and znPdl,   pdl,  coPdl,  zoneDailyMult,   false)
+f_zone(shPdo and znPdo,   pdo,  coPdo,  zoneDailyMult,   false)
+f_zone(shPdc and znPdc,   pdc,  coPdc,  zoneDailyMult,   false)
+f_zone(shCdo and znCdo,   cdo,  coCdo,  zoneDailyMult,   false)
+f_zone(shCdh and znCdh,   cdH,  coCdh,  zoneDailyMult,   true)
+f_zone(shCdl and znCdl,   cdL,  coCdl,  zoneDailyMult,   false)
+f_zone(shPwh and znPwh,   pwh,  coPwh,  zoneWeeklyMult,  true)
+f_zone(shPwl and znPwl,   pwl,  coPwl,  zoneWeeklyMult,  false)
+f_zone(shCwh and znCwh,   cwH,  coCwh,  zoneWeeklyMult,  true)
+f_zone(shCwl and znCwl,   cwL,  coCwl,  zoneWeeklyMult,  false)
+f_zone(shPmoh and znPmoh, pmoH, coPmoh, zoneMonthlyMult, true)
+f_zone(shPmol and znPmol, pmoL, coPmol, zoneMonthlyMult, false)
+f_zone(shO1h and znO1h,   o1H,  coO1h,  zoneDailyMult,   true)
+f_zone(shO1l and znO1l,   o1L,  coO1l,  zoneDailyMult,   false)
+f_zone(shO5h and znO5h,   o5H,  coO5h,  zoneDailyMult,   true)
+f_zone(shO5l and znO5l,   o5L,  coO5l,  zoneDailyMult,   false)
+f_zone(shO15h and znO15h, o15H, coO15h, zoneDailyMult,   true)
+f_zone(shO15l and znO15l, o15L, coO15l, zoneDailyMult,   false)
+f_zone(shAhh and znAhh,   ahH,  coAhh,  zoneDailyMult,   true)
+f_zone(shAhl and znAhl,   ahL,  coAhl,  zoneDailyMult,   false)
+
+// =========================================================================
+// LABELS (offset right of the last bar, with connector)
+// =========================================================================
+f_label(shPmh,  pmH,  coPmh,  wdPmh,  stPmh,  lbPmh,  lpPmh,  ltPmh,  lsPmh,  lcPmh,  lxPmh,  ofPmh)
+f_label(shPml,  pmL,  coPml,  wdPml,  stPml,  lbPml,  lpPml,  ltPml,  lsPml,  lcPml,  lxPml,  ofPml)
+f_label(shPdh,  pdh,  coPdh,  wdPdh,  stPdh,  lbPdh,  lpPdh,  ltPdh,  lsPdh,  lcPdh,  lxPdh,  ofPdh)
+f_label(shPdl,  pdl,  coPdl,  wdPdl,  stPdl,  lbPdl,  lpPdl,  ltPdl,  lsPdl,  lcPdl,  lxPdl,  ofPdl)
+f_label(shPdo,  pdo,  coPdo,  wdPdo,  stPdo,  lbPdo,  lpPdo,  ltPdo,  lsPdo,  lcPdo,  lxPdo,  ofPdo)
+f_label(shPdc,  pdc,  coPdc,  wdPdc,  stPdc,  lbPdc,  lpPdc,  ltPdc,  lsPdc,  lcPdc,  lxPdc,  ofPdc)
+f_label(shCdo,  cdo,  coCdo,  wdCdo,  stCdo,  lbCdo,  lpCdo,  ltCdo,  lsCdo,  lcCdo,  lxCdo,  ofCdo)
+f_label(shCdh,  cdH,  coCdh,  wdCdh,  stCdh,  lbCdh,  lpCdh,  ltCdh,  lsCdh,  lcCdh,  lxCdh,  ofCdh)
+f_label(shCdl,  cdL,  coCdl,  wdCdl,  stCdl,  lbCdl,  lpCdl,  ltCdl,  lsCdl,  lcCdl,  lxCdl,  ofCdl)
+f_label(shPwh,  pwh,  coPwh,  wdPwh,  stPwh,  lbPwh,  lpPwh,  ltPwh,  lsPwh,  lcPwh,  lxPwh,  ofPwh)
+f_label(shPwl,  pwl,  coPwl,  wdPwl,  stPwl,  lbPwl,  lpPwl,  ltPwl,  lsPwl,  lcPwl,  lxPwl,  ofPwl)
+f_label(shCwh,  cwH,  coCwh,  wdCwh,  stCwh,  lbCwh,  lpCwh,  ltCwh,  lsCwh,  lcCwh,  lxCwh,  ofCwh)
+f_label(shCwl,  cwL,  coCwl,  wdCwl,  stCwl,  lbCwl,  lpCwl,  ltCwl,  lsCwl,  lcCwl,  lxCwl,  ofCwl)
+f_label(shPmoh, pmoH, coPmoh, wdPmoh, stPmoh, lbPmoh, lpPmoh, ltPmoh, lsPmoh, lcPmoh, lxPmoh, ofPmoh)
+f_label(shPmol, pmoL, coPmol, wdPmol, stPmol, lbPmol, lpPmol, ltPmol, lsPmol, lcPmol, lxPmol, ofPmol)
+f_label(shO1h,  o1H,  coO1h,  wdO1h,  stO1h,  lbO1h,  lpO1h,  ltO1h,  lsO1h,  lcO1h,  lxO1h,  ofO1h)
+f_label(shO1l,  o1L,  coO1l,  wdO1l,  stO1l,  lbO1l,  lpO1l,  ltO1l,  lsO1l,  lcO1l,  lxO1l,  ofO1l)
+f_label(shO5h,  o5H,  coO5h,  wdO5h,  stO5h,  lbO5h,  lpO5h,  ltO5h,  lsO5h,  lcO5h,  lxO5h,  ofO5h)
+f_label(shO5l,  o5L,  coO5l,  wdO5l,  stO5l,  lbO5l,  lpO5l,  ltO5l,  lsO5l,  lcO5l,  lxO5l,  ofO5l)
+f_label(shO15h, o15H, coO15h, wdO15h, stO15h, lbO15h, lpO15h, ltO15h, lsO15h, lcO15h, lxO15h, ofO15h)
+f_label(shO15l, o15L, coO15l, wdO15l, stO15l, lbO15l, lpO15l, ltO15l, lsO15l, lcO15l, lxO15l, ofO15l)
+f_label(shAhh,  ahH,  coAhh,  wdAhh,  stAhh,  lbAhh,  lpAhh,  ltAhh,  lsAhh,  lcAhh,  lxAhh,  ofAhh)
+f_label(shAhl,  ahL,  coAhl,  wdAhl,  stAhl,  lbAhl,  lpAhl,  ltAhl,  lsAhl,  lcAhl,  lxAhl,  ofAhl)
+
+// =========================================================================
+// DAILY GAP BOX — prior RTH close to today's RTH open, 09:30 through 16:00
+// =========================================================================
+var box gapBox = na
+if gapOn and rthStart and levelDay and not na(pdc) and pdc != cdo
+    if levelsMode == "Last Day" and not na(gapBox)
+        box.delete(gapBox)
+    gapBox := box.new(bar_index, math.max(pdc, cdo), bar_index, math.min(pdc, cdo), gapBorder, gapW, f_lineSty(gapSty), extend.none, xloc.bar_index, gapFill)
+if gapOn and inRTH and levelDay and not na(gapBox)
+    box.set_right(gapBox, bar_index)
+
+// =========================================================================
+// NEWS TIME LINE — vertical line at HH:MM ET on each shown day
+// =========================================================================
+int newsTs = timestamp(tz, year(time, tz), month(time, tz), dayofmonth(time, tz), newsHour, newsMin)
+bool newsBar = newsOn and isWeekday and levelDay and time <= newsTs and newsTs < time_close
+var line newsLn = na
+if newsBar
+    if levelsMode == "Last Day" and not na(newsLn)
+        line.delete(newsLn)
+    newsLn := line.new(bar_index, low, bar_index, high, xloc.bar_index, extend.both, newsCol, f_lineSty(newsSty), newsW)
+
+// =========================================================================
+// ALERTS — close crosses any shown level, muted inside the no-alert period
+// =========================================================================
+string xMsg = f_cross(shPmh, pmH, "Pre-market high") + f_cross(shPml, pmL, "Pre-market low") +
+     f_cross(shPdh, pdh, "Prev day high") + f_cross(shPdl, pdl, "Prev day low") +
+     f_cross(shPdo, pdo, "Prev day open") + f_cross(shPdc, pdc, "Prev day close") + f_cross(shCdo, cdo, "Current day open") +
+     f_cross(shPwh, pwh, "Prev week high") + f_cross(shPwl, pwl, "Prev week low") +
+     f_cross(shCwh, cwH, "Current week high") + f_cross(shCwl, cwL, "Current week low") +
+     f_cross(shPmoh, pmoH, "Prev month high") + f_cross(shPmol, pmoL, "Prev month low") +
+     f_cross(shO1h, o1H, "1st Candle High") + f_cross(shO1l, o1L, "1st Candle Low") +
+     f_cross(shO5h, o5H, "5 min High") + f_cross(shO5l, o5L, "5 min Low") +
+     f_cross(shO15h, o15H, "15 min High") + f_cross(shO15l, o15L, "15 min Low") +
+     f_cross(shAhh, ahH, "After-hour high") + f_cross(shAhl, ahL, "After-hour Low")
+bool noAlertNow = noAlertOn and not na(time(timeframe.period, noAlertSession + ":23456", tz))
+if alertsOn and not noAlertNow and not newDay and xMsg != "" and barstate.isconfirmed
+    alert(syminfo.ticker + " crossed: " + xMsg, alert.freq_once_per_bar_close)
+
+// =========================================================================
+// A+ TRADE CHECKLIST TABLE
+// =========================================================================
+if tblOn and barstate.islast
+    var table t = table.new(f_pos(tblPos), 2, 40, bgcolor = tblBg, frame_color = tblFrame, frame_width = 1, border_color = tblBorder, border_width = 1)
+    table.clear(t, 0, 0, 1, 39)
+    int r = 0
+    if ckIdx
+        bool idxOk = not na(idxClose) and not na(idxPdh) and not na(idxPdl)
+        string s = not idxOk ? "—" : idxClose > idxPdh ? aboveTxt : idxClose < idxPdl ? belowTxt : insideTxt
+        color c = not idxOk ? tblText : idxClose > idxPdh ? upCol : idxClose < idxPdl ? dnCol : tblText
+        r := f_row(t, r, "Index Trend (" + indexSym + ")", s, c)
+    if ckPd
+        [s, c] = f_rangeStatus(pdh, pdl)
+        r := f_row(t, r, "Prev Day", s, c)
+    if ckPdh
+        [s, c] = f_lvlStatus(pdh)
+        r := f_row(t, r, "Prev day high", s, c)
+    if ckPdl
+        [s, c] = f_lvlStatus(pdl)
+        r := f_row(t, r, "Prev day low", s, c)
+    if ckPm
+        [s, c] = f_rangeStatus(pmH, pmL)
+        r := f_row(t, r, "Pre-market", s, c)
+    if ckPmh
+        [s, c] = f_lvlStatus(pmH)
+        r := f_row(t, r, "Pre-market high", s, c)
+    if ckPml
+        [s, c] = f_lvlStatus(pmL)
+        r := f_row(t, r, "Pre-market low", s, c)
+    if ckPdo
+        [s, c] = f_lvlStatus(pdo)
+        r := f_row(t, r, "Prev day open", s, c)
+    if ckPdc
+        [s, c] = f_lvlStatus(pdc)
+        r := f_row(t, r, "Prev day close", s, c)
+    if ckCdo
+        [s, c] = f_lvlStatus(cdo)
+        r := f_row(t, r, "Current day open", s, c)
+    if ckPw
+        [s, c] = f_rangeStatus(pwh, pwl)
+        r := f_row(t, r, "Prev Week", s, c)
+    if ckPwh
+        [s, c] = f_lvlStatus(pwh)
+        r := f_row(t, r, "Prev week high", s, c)
+    if ckPwl
+        [s, c] = f_lvlStatus(pwl)
+        r := f_row(t, r, "Prev week low", s, c)
+    if ckCw
+        [s, c] = f_rangeStatus(cwH, cwL)
+        r := f_row(t, r, "Current Week", s, c)
+    if ckCwh
+        [s, c] = f_lvlStatus(cwH)
+        r := f_row(t, r, "Current week high", s, c)
+    if ckCwl
+        [s, c] = f_lvlStatus(cwL)
+        r := f_row(t, r, "Current week low", s, c)
+    if ckPmo
+        [s, c] = f_rangeStatus(pmoH, pmoL)
+        r := f_row(t, r, "Prev Month", s, c)
+    if ckPmoh
+        [s, c] = f_lvlStatus(pmoH)
+        r := f_row(t, r, "Prev month high", s, c)
+    if ckPmol
+        [s, c] = f_lvlStatus(pmoL)
+        r := f_row(t, r, "Prev month low", s, c)
+    if ckO1
+        [s, c] = f_rangeStatus(o1H, o1L)
+        r := f_row(t, r, "1st Candle", s, c)
+    if ckO1h
+        [s, c] = f_lvlStatus(o1H)
+        r := f_row(t, r, "1st Candle High", s, c)
+    if ckO1l
+        [s, c] = f_lvlStatus(o1L)
+        r := f_row(t, r, "1st Candle Low", s, c)
+    if ckO5
+        [s, c] = f_rangeStatus(o5H, o5L)
+        r := f_row(t, r, "5 min Candles", s, c)
+    if ckO5h
+        [s, c] = f_lvlStatus(o5H)
+        r := f_row(t, r, "5 min Candles High", s, c)
+    if ckO5l
+        [s, c] = f_lvlStatus(o5L)
+        r := f_row(t, r, "5 min Candles Low", s, c)
+    if ckO15
+        [s, c] = f_rangeStatus(o15H, o15L)
+        r := f_row(t, r, "15 min Candles", s, c)
+    if ckO15h
+        [s, c] = f_lvlStatus(o15H)
+        r := f_row(t, r, "15 min Candles High", s, c)
+    if ckO15l
+        [s, c] = f_lvlStatus(o15L)
+        r := f_row(t, r, "15 min Candles Low", s, c)
+    if ckAhh
+        [s, c] = f_lvlStatus(ahH)
+        r := f_row(t, r, "After-hour high", s, c)
+    if ckAhl
+        [s, c] = f_lvlStatus(ahL)
+        r := f_row(t, r, "After-hour Low", s, c)
+    if ckVwap
+        [s, c] = f_lvlStatus(vwapVal)
+        r := f_row(t, r, "VWAP", s, c)
+    if ckMa
+        [s, c] = f_lvlStatus(maVal)
+        r := f_row(t, r, maType + " " + str.tostring(maLen) + (maTf == "Chart" ? "" : " (" + maTf + ")"), s, c)
+    if ckAdx
+        bool adxOk = not na(adxVal)
+        string s = not adxOk ? "—" : (adxVal > adxThr ? "Trending " : "Weak ") + str.tostring(adxVal, "#.#")
+        color c = not adxOk ? tblText : adxVal > adxThr ? upCol : dnCol
+        r := f_row(t, r, "ADX > " + str.tostring(adxThr, "#.#"), s, c)
+    if ckRvol
+        bool rvOk = not na(rvol)
+        string s = not rvOk ? "—" : (rvol >= rvolThr ? "High " : "Low ") + str.tostring(rvol, "#.##")
+        color c = not rvOk ? tblText : rvol >= rvolThr ? upCol : dnCol
+        r := f_row(t, r, "RVOL ≥ " + str.tostring(rvolThr, "#.#"), s, c)

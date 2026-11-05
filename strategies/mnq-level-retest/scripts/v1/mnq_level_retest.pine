@@ -1,0 +1,354 @@
+//@version=6
+// MNQ Level Break and Retest v1.0.0
+
+strategy(
+     title                   = "MNQ Level Break and Retest",
+     shorttitle              = "MNQ Level Retest",
+     overlay                 = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 10,
+     initial_capital         = 625000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.62,
+     slippage                = 1,
+     calc_on_order_fills     = true,
+     process_orders_on_close = false)
+
+string TZ          = "America/New_York"
+string GRP_SESSION = "Session"
+string GRP_LEVELS  = "Levels"
+string GRP_SETUP   = "Break and Retest"
+string GRP_RISK    = "Risk"
+string GRP_VISUAL  = "Visuals"
+
+string entrySession = input.session("0930-1100", "Entry session (ET)", group = GRP_SESSION)
+bool closeAt1600 = input.bool(true, "Close open position at 16:00 ET", group = GRP_SESSION)
+
+bool usePremarketHigh = input.bool(true, "Enable Premarket High (PMH)", group = GRP_LEVELS)
+bool showPremarketHigh = input.bool(true, "Plot Premarket High", group = GRP_LEVELS)
+bool usePremarketLow = input.bool(true, "Enable Premarket Low (PML)", group = GRP_LEVELS)
+bool showPremarketLow = input.bool(true, "Plot Premarket Low", group = GRP_LEVELS)
+bool usePreviousHigh = input.bool(true, "Enable Previous RTH High (PDH)", group = GRP_LEVELS)
+bool showPreviousHigh = input.bool(true, "Plot Previous RTH High", group = GRP_LEVELS)
+bool usePreviousLow = input.bool(true, "Enable Previous RTH Low (PDL)", group = GRP_LEVELS)
+bool showPreviousLow = input.bool(true, "Plot Previous RTH Low", group = GRP_LEVELS)
+bool useFirstFiveHigh = input.bool(true, "Enable First 5-Minute High (5mH)", group = GRP_LEVELS)
+bool showFirstFiveHigh = input.bool(true, "Plot First 5-Minute High", group = GRP_LEVELS)
+bool useFirstFiveLow = input.bool(true, "Enable First 5-Minute Low (5mL)", group = GRP_LEVELS)
+bool showFirstFiveLow = input.bool(true, "Plot First 5-Minute Low", group = GRP_LEVELS)
+
+float breakoutBuffer = input.float(10.0, "Breakout buffer (points)", minval = 0.0, step = 0.25, group = GRP_SETUP)
+string retestMode = input.string("Both", "Retest mode", options = ["Standard", "Displacement", "Both"], group = GRP_SETUP)
+float maxRetestPenetration = input.float(12.0, "Maximum retest penetration (points)", minval = 0.0, step = 0.25, group = GRP_SETUP)
+float displacementPoints = input.float(20.0, "Displacement beyond level (points)", minval = 0.0, step = 0.25, group = GRP_SETUP)
+int displacementBars = input.int(6, "Displacement retest bars after breakout", minval = 1, maxval = 30, group = GRP_SETUP,
+     tooltip = "Counts bars 1 through N after the breakout bar. The breakout bar is bar 0.")
+
+int contracts = input.int(10, "Contracts", minval = 1, group = GRP_RISK)
+float stopPoints = input.float(50.0, "Stop loss (points)", minval = 0.25, step = 0.25, group = GRP_RISK)
+float targetPoints = input.float(100.0, "Profit target (points)", minval = 0.25, step = 0.25, group = GRP_RISK)
+int maxTradesPerDay = input.int(2, "Maximum trades per ET day", minval = 1, maxval = 10, group = GRP_RISK)
+
+bool markStates = input.bool(true, "Mark breakout / retest / entry states", group = GRP_VISUAL)
+bool showDebugTable = input.bool(false, "Show status table", group = GRP_VISUAL)
+
+bool isOneMinute = timeframe.isminutes and timeframe.multiplier == 1
+int etYear = year(time, TZ)
+int etMonth = month(time, TZ)
+int etDay = dayofmonth(time, TZ)
+int etDate = etYear * 10000 + etMonth * 100 + etDay
+int previousEtDate = year(time[1], TZ) * 10000 + month(time[1], TZ) * 100 + dayofmonth(time[1], TZ)
+bool newEtDay = na(time[1]) or etDate != previousEtDate
+bool isWeekday = dayofweek(time, TZ) >= dayofweek.monday and dayofweek(time, TZ) <= dayofweek.friday
+bool inPremarket = isWeekday and not na(time(timeframe.period, "0400-0930:23456", TZ))
+bool inRth = isWeekday and not na(time(timeframe.period, "0930-1600:23456", TZ))
+bool inFirstFive = isWeekday and not na(time(timeframe.period, "0930-0935:23456", TZ))
+bool inEntrySession = isWeekday and not na(time(timeframe.period, entrySession + ":23456", TZ))
+bool rthStart = inRth and not inRth[1]
+bool is0934Bar = hour(time, TZ) == 9 and minute(time, TZ) == 34
+bool rthEndBar = inRth and hour(time_close, TZ) == 16 and minute(time_close, TZ) == 0
+
+var float premarketHigh = na
+var float premarketLow = na
+var float currentRthHigh = na
+var float currentRthLow = na
+var float previousRthHigh = na
+var float previousRthLow = na
+var float firstFiveHigh = na
+var float firstFiveLow = na
+var bool firstFiveReady = false
+var int firstFiveReadyBar = na
+
+if newEtDay
+    premarketHigh := na
+    premarketLow := na
+    firstFiveHigh := na
+    firstFiveLow := na
+    firstFiveReady := false
+    firstFiveReadyBar := na
+
+if inPremarket
+    premarketHigh := na(premarketHigh) ? high : math.max(premarketHigh, high)
+    premarketLow := na(premarketLow) ? low : math.min(premarketLow, low)
+
+if rthStart
+    if not na(currentRthHigh) and not na(currentRthLow)
+        previousRthHigh := currentRthHigh
+        previousRthLow := currentRthLow
+    currentRthHigh := high
+    currentRthLow := low
+else if inRth
+    currentRthHigh := na(currentRthHigh) ? high : math.max(currentRthHigh, high)
+    currentRthLow := na(currentRthLow) ? low : math.min(currentRthLow, low)
+
+if inFirstFive
+    firstFiveHigh := na(firstFiveHigh) ? high : math.max(firstFiveHigh, high)
+    firstFiveLow := na(firstFiveLow) ? low : math.min(firstFiveLow, low)
+    if is0934Bar and barstate.isconfirmed
+        firstFiveReady := true
+        firstFiveReadyBar := bar_index
+
+bool firstFiveAvailable = firstFiveReady and not na(firstFiveReadyBar) and bar_index > firstFiveReadyBar
+
+// State: 0 = idle, 1 = waiting for retest, 2 = next-candle entry pending.
+var int setupState = 0
+var int setupDirection = 0
+var float activeLevel = na
+var string activeLevelName = ""
+var int breakoutBar = na
+var bool displacementReached = false
+var bool displacementExpired = false
+var int retestBar = na
+var float pendingEntryPrice = na
+var int tradesToday = 0
+var bool wonToday = false
+var bool hadOpenPosition = false
+var float netProfitAtEntry = na
+var int lastEntryBar = na
+
+bool breakoutMarked = false
+bool retestMarked = false
+bool entryMarked = false
+
+if newEtDay
+    tradesToday := 0
+    wonToday := false
+    if setupState != 0
+        strategy.cancel("Level Long")
+        strategy.cancel("Level Short")
+        setupState := 0
+        setupDirection := 0
+        activeLevel := na
+        activeLevelName := ""
+        breakoutBar := na
+        displacementReached := false
+        displacementExpired := false
+        retestBar := na
+        pendingEntryPrice := na
+
+bool newPosition = strategy.position_size != 0 and not hadOpenPosition and (na(lastEntryBar) or bar_index != lastEntryBar)
+if newPosition
+    hadOpenPosition := true
+    netProfitAtEntry := strategy.netprofit
+    tradesToday += 1
+    lastEntryBar := bar_index
+    entryMarked := true
+    setupState := 0
+    setupDirection := 0
+    activeLevel := na
+    activeLevelName := ""
+    breakoutBar := na
+    displacementReached := false
+    displacementExpired := false
+    retestBar := na
+    pendingEntryPrice := na
+
+if hadOpenPosition and strategy.position_size == 0
+    float completedPositionPnl = strategy.netprofit - nz(netProfitAtEntry, strategy.netprofit)
+    if completedPositionPnl > 0
+        wonToday := true
+    hadOpenPosition := false
+    netProfitAtEntry := na
+
+bool canStartSetup = isOneMinute and barstate.isconfirmed and inEntrySession and setupState == 0 and
+     strategy.position_size == 0 and strategy.opentrades == 0 and tradesToday < maxTradesPerDay and not wonToday
+
+float selectedLongLevel = na
+string selectedLongName = ""
+float selectedShortLevel = na
+string selectedShortName = ""
+
+bool pmhBreak = canStartSetup and usePremarketHigh and not na(premarketHigh) and
+     close >= premarketHigh + breakoutBuffer and close[1] < premarketHigh + breakoutBuffer
+bool pdhBreak = canStartSetup and usePreviousHigh and not na(previousRthHigh) and
+     close >= previousRthHigh + breakoutBuffer and close[1] < previousRthHigh + breakoutBuffer
+bool fiveHighBreak = canStartSetup and useFirstFiveHigh and firstFiveAvailable and not na(firstFiveHigh) and
+     close >= firstFiveHigh + breakoutBuffer and close[1] < firstFiveHigh + breakoutBuffer
+bool pmlBreak = canStartSetup and usePremarketLow and not na(premarketLow) and
+     close <= premarketLow - breakoutBuffer and close[1] > premarketLow - breakoutBuffer
+bool pdlBreak = canStartSetup and usePreviousLow and not na(previousRthLow) and
+     close <= previousRthLow - breakoutBuffer and close[1] > previousRthLow - breakoutBuffer
+bool fiveLowBreak = canStartSetup and useFirstFiveLow and firstFiveAvailable and not na(firstFiveLow) and
+     close <= firstFiveLow - breakoutBuffer and close[1] > firstFiveLow - breakoutBuffer
+
+if pmhBreak
+    selectedLongLevel := premarketHigh
+    selectedLongName := "PMH"
+if pdhBreak and (na(selectedLongLevel) or previousRthHigh > selectedLongLevel)
+    selectedLongLevel := previousRthHigh
+    selectedLongName := "PDH"
+if fiveHighBreak and (na(selectedLongLevel) or firstFiveHigh > selectedLongLevel)
+    selectedLongLevel := firstFiveHigh
+    selectedLongName := "5mH"
+
+if pmlBreak
+    selectedShortLevel := premarketLow
+    selectedShortName := "PML"
+if pdlBreak and (na(selectedShortLevel) or previousRthLow < selectedShortLevel)
+    selectedShortLevel := previousRthLow
+    selectedShortName := "PDL"
+if fiveLowBreak and (na(selectedShortLevel) or firstFiveLow < selectedShortLevel)
+    selectedShortLevel := firstFiveLow
+    selectedShortName := "5mL"
+
+bool hasLongBreak = not na(selectedLongLevel)
+bool hasShortBreak = not na(selectedShortLevel)
+if canStartSetup and hasLongBreak != hasShortBreak
+    setupState := 1
+    setupDirection := hasLongBreak ? 1 : -1
+    activeLevel := hasLongBreak ? selectedLongLevel : selectedShortLevel
+    activeLevelName := hasLongBreak ? selectedLongName : selectedShortName
+    breakoutBar := bar_index
+    displacementReached := false
+    displacementExpired := false
+    breakoutMarked := true
+
+if setupState == 1 and bar_index > breakoutBar
+    int barsAfterBreakout = bar_index - breakoutBar
+    bool setupInvalid = setupDirection == 1 ? close < activeLevel : close > activeLevel
+    bool retestCandle = setupDirection == 1 ?
+         low <= activeLevel and low >= activeLevel - maxRetestPenetration and close > activeLevel :
+         high >= activeLevel and high <= activeLevel + maxRetestPenetration and close < activeLevel
+    bool standardAllowed = retestMode == "Standard" or retestMode == "Both"
+    bool displacementAllowed = retestMode == "Displacement" or retestMode == "Both"
+    // displacementReached only contains evidence from earlier bars, enforcing
+    // "reach displacement, then retest" rather than assuming intrabar ordering.
+    bool displacementRetest = displacementAllowed and not displacementExpired and displacementReached and
+         barsAfterBreakout >= 1 and barsAfterBreakout <= displacementBars and retestCandle
+    bool acceptedRetest = not setupInvalid and ((standardAllowed and retestCandle) or displacementRetest)
+
+    if setupInvalid or not inEntrySession
+        setupState := 0
+        setupDirection := 0
+        activeLevel := na
+        activeLevelName := ""
+        breakoutBar := na
+        displacementReached := false
+        displacementExpired := false
+    else if acceptedRetest
+        retestBar := bar_index
+        pendingEntryPrice := setupDirection == 1 ? close + syminfo.mintick : close - syminfo.mintick
+        setupState := 2
+        retestMarked := true
+        if setupDirection == 1
+            strategy.entry("Level Long", strategy.long, qty = contracts, stop = pendingEntryPrice)
+        else
+            strategy.entry("Level Short", strategy.short, qty = contracts, stop = pendingEntryPrice)
+    else
+        if displacementAllowed and not displacementExpired and barsAfterBreakout <= displacementBars
+            bool reachedNow = setupDirection == 1 ? high >= activeLevel + displacementPoints : low <= activeLevel - displacementPoints
+            if reachedNow
+                displacementReached := true
+        // No retest was accepted on the final eligible bar, so the
+        // displacement path expires whether or not displacement was reached.
+        if displacementAllowed and barsAfterBreakout >= displacementBars
+            displacementExpired := true
+            if retestMode == "Displacement"
+                setupState := 0
+                setupDirection := 0
+                activeLevel := na
+                activeLevelName := ""
+                breakoutBar := na
+
+if setupState == 2 and strategy.position_size == 0
+    bool pendingWindowOver = bar_index > retestBar + 1
+    bool nextBarClosed = bar_index == retestBar + 1 and barstate.isconfirmed
+    bool pendingInvalid = setupDirection == 1 ? close < activeLevel : close > activeLevel
+    if not inEntrySession or pendingWindowOver or nextBarClosed or pendingInvalid
+        strategy.cancel("Level Long")
+        strategy.cancel("Level Short")
+        setupState := 0
+        setupDirection := 0
+        activeLevel := na
+        activeLevelName := ""
+        breakoutBar := na
+        displacementReached := false
+        displacementExpired := false
+        retestBar := na
+        pendingEntryPrice := na
+
+if not inEntrySession and setupState != 0 and strategy.position_size == 0
+    strategy.cancel("Level Long")
+    strategy.cancel("Level Short")
+    setupState := 0
+    setupDirection := 0
+    activeLevel := na
+    activeLevelName := ""
+    breakoutBar := na
+    displacementReached := false
+    displacementExpired := false
+    retestBar := na
+    pendingEntryPrice := na
+
+if strategy.position_size > 0
+    strategy.exit("Level Long Exit", "Level Long",
+         stop = strategy.position_avg_price - stopPoints,
+         limit = strategy.position_avg_price + targetPoints)
+else if strategy.position_size < 0
+    strategy.exit("Level Short Exit", "Level Short",
+         stop = strategy.position_avg_price + stopPoints,
+         limit = strategy.position_avg_price - targetPoints)
+
+if rthEndBar
+    strategy.cancel("Level Long")
+    strategy.cancel("Level Short")
+    if closeAt1600 and strategy.position_size != 0
+        strategy.close_all(comment = "16:00 ET close", immediately = true)
+
+plot(showPremarketHigh and usePremarketHigh ? premarketHigh : na, "Premarket High", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+plot(showPremarketLow and usePremarketLow ? premarketLow : na, "Premarket Low", color = color.teal, linewidth = 2, style = plot.style_linebr)
+plot(showPreviousHigh and usePreviousHigh ? previousRthHigh : na, "Previous RTH High", color = color.fuchsia, linewidth = 2, style = plot.style_linebr)
+plot(showPreviousLow and usePreviousLow ? previousRthLow : na, "Previous RTH Low", color = color.purple, linewidth = 2, style = plot.style_linebr)
+plot(showFirstFiveHigh and useFirstFiveHigh and firstFiveAvailable ? firstFiveHigh : na, "First 5-Minute High", color = color.lime, linewidth = 2, style = plot.style_linebr)
+plot(showFirstFiveLow and useFirstFiveLow and firstFiveAvailable ? firstFiveLow : na, "First 5-Minute Low", color = color.orange, linewidth = 2, style = plot.style_linebr)
+
+bgcolor(markStates and setupState == 1 ? color.new(setupDirection == 1 ? color.lime : color.red, 92) :
+     markStates and setupState == 2 ? color.new(color.yellow, 88) : na, title = "Setup State")
+plotshape(markStates and breakoutMarked, title = "Breakout", style = shape.circle, location = location.abovebar,
+     color = setupDirection == 1 ? color.lime : color.red, size = size.tiny, text = "B")
+plotshape(markStates and retestMarked, title = "Retest", style = shape.diamond, location = location.belowbar,
+     color = color.yellow, size = size.tiny, text = "R")
+plotshape(markStates and entryMarked, title = "Entry Filled", style = shape.triangleup, location = location.belowbar,
+     color = color.white, size = size.tiny, text = "E")
+
+var table warningTable = table.new(position.top_right, 1, 1)
+var table debugTable = table.new(position.bottom_right, 2, 4, border_width = 1)
+if barstate.islast
+    if not isOneMinute
+        table.cell(warningTable, 0, 0, "MNQ Level Retest: use a 1-minute chart\nTrading disabled", bgcolor = color.red, text_color = color.white)
+    else
+        table.cell(warningTable, 0, 0, "", bgcolor = color.new(color.black, 100))
+
+    if showDebugTable
+        string stateText = strategy.position_size != 0 ? "In position" : setupState == 1 ? "Waiting retest" : setupState == 2 ? "Pending next bar" : "Idle"
+        table.cell(debugTable, 0, 0, "State", bgcolor = color.gray, text_color = color.white)
+        table.cell(debugTable, 1, 0, stateText)
+        table.cell(debugTable, 0, 1, "Level", bgcolor = color.gray, text_color = color.white)
+        table.cell(debugTable, 1, 1, activeLevelName == "" ? "—" : activeLevelName)
+        table.cell(debugTable, 0, 2, "Trades today", bgcolor = color.gray, text_color = color.white)
+        table.cell(debugTable, 1, 2, str.tostring(tradesToday))
+        table.cell(debugTable, 0, 3, "Won today", bgcolor = color.gray, text_color = color.white)
+        table.cell(debugTable, 1, 3, wonToday ? "Yes" : "No")
+    else
+        table.clear(debugTable, 0, 0, 1, 3)

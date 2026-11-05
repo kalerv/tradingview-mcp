@@ -1,0 +1,550 @@
+//@version=6
+// daily-trading-levels v1.0.0
+// Path: indicators/daily-trading-levels/scripts/v1/daily_trading_levels.pine
+//
+// Marks PDH/PDL, PMH/PML, ORB (1st candle / 5m / 15m / 30m / 1H), Gap, Intraday H/L,
+// previous week + previous month H/L as right-edge marks,
+// optional Session VWAP, and up to 8 configurable EMAs.
+//
+// Daily levels are plot() series on the bars (they scroll and zoom with price),
+// shown only inside the levels window (default 04:00-16:00 ET) and, by default,
+// only for the most recent day. Weekly / monthly levels are short line.new()
+// marks ending at the last bar, so they never stretch back to the candle that set them.
+//
+// Plot budget (Pine RE10140 limit is 64 plot counts):
+//   A plot() with an input.color counts 2; with a const color counts 1;
+//   fill() counts 1 only when its color is a series. line.new / label.new count 0.
+//   17 daily levels x2 = 34, gap 2 x2 = 4, VWAP 1 x2 = 2, VWAP bands 4 x1 = 4,
+//   EMAs 8 x2 = 16, fill 0  ->  60 of 64.
+//   Adding another input-colored plot costs 2. Keep the total at or under 64.
+
+indicator("Daily Trading Levels", shorttitle = "DTL", overlay = true, max_boxes_count = 50, max_labels_count = 100, max_lines_count = 100)
+
+// =========================================================================
+// INPUTS — General
+// =========================================================================
+string GRP_GEN = "General"
+string sessionTz = input.string("America/New_York", "Timezone", group = GRP_GEN, display = display.none)
+bool showLabels = input.bool(true, "Show level labels", group = GRP_GEN)
+string labelSizeIn = input.string("Small", "Label size", options = ["Tiny", "Small", "Normal", "Large"], group = GRP_GEN, display = display.none)
+string levelDaysMode = input.string("Last day only", "Show daily levels on", options = ["Last day only", "All days"], group = GRP_GEN, display = display.none,
+     tooltip = "Last day only: PD / PM / ORB / intraday levels and the gap appear only for the most recent trading day. Scrolling back shows clean candles. All days: every day shows its own levels.")
+string levelSession = input.session("0400-1600", "Daily levels window (ET)", group = GRP_GEN, display = display.none,
+     tooltip = "Daily levels are drawn only inside this window. Nothing is drawn outside it.")
+int markBars = input.int(20, "Weekly / monthly mark length (bars)", minval = 2, maxval = 200, group = GRP_GEN, display = display.none,
+     tooltip = "Previous week / month levels are short marks ending at the latest bar, this many bars long.")
+
+labelSize = labelSizeIn == "Tiny" ? size.tiny : labelSizeIn == "Small" ? size.small : labelSizeIn == "Large" ? size.large : size.normal
+
+// =========================================================================
+// INPUTS — Previous Day
+// =========================================================================
+string GRP_PD = "Previous Day (PDH / PDL / PDC)"
+bool showPdh = input.bool(true, "Show PDH", group = GRP_PD, inline = "pdh")
+color colPdh = input.color(color.new(#f5a623, 0), "", group = GRP_PD, inline = "pdh")
+string styPdh = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PD, inline = "pdh", display = display.none)
+int wPdh = input.int(2, "", minval = 1, maxval = 4, group = GRP_PD, inline = "pdh", display = display.none)
+
+bool showPdl = input.bool(true, "Show PDL", group = GRP_PD, inline = "pdl")
+string styPdl = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PD, inline = "pdl", display = display.none)
+int wPdl = input.int(2, "", minval = 1, maxval = 4, group = GRP_PD, inline = "pdl", display = display.none)
+
+bool showPdc = input.bool(false, "Show PDC (prior RTH close)", group = GRP_PD, inline = "pdc")
+color colPdc = input.color(color.new(#787b86, 0), "", group = GRP_PD, inline = "pdc")
+string styPdc = input.string("Dashed", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PD, inline = "pdc", display = display.none)
+int wPdc = input.int(2, "", minval = 1, maxval = 4, group = GRP_PD, inline = "pdc", display = display.none)
+
+// =========================================================================
+// INPUTS — Previous Week (right-edge marks)
+// =========================================================================
+string GRP_PW = "Previous Week (PWH / PWL) — mark at latest bar"
+bool showPwh = input.bool(true, "Show PWH", group = GRP_PW, inline = "pwh")
+color colPwh = input.color(color.new(#26c6da, 0), "", group = GRP_PW, inline = "pwh")
+string styPwh = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PW, inline = "pwh", display = display.none)
+int wPwh = input.int(2, "", minval = 1, maxval = 4, group = GRP_PW, inline = "pwh", display = display.none)
+
+bool showPwl = input.bool(true, "Show PWL", group = GRP_PW, inline = "pwl")
+string styPwl = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PW, inline = "pwl", display = display.none)
+int wPwl = input.int(2, "", minval = 1, maxval = 4, group = GRP_PW, inline = "pwl", display = display.none)
+
+// =========================================================================
+// INPUTS — Previous Month (right-edge marks)
+// =========================================================================
+string GRP_PMO = "Previous Month (PMoH / PMoL) — mark at latest bar"
+bool showPmoH = input.bool(true, "Show PMoH", group = GRP_PMO, inline = "pmoh")
+color colPmoH = input.color(color.new(#ff7043, 0), "", group = GRP_PMO, inline = "pmoh")
+string styPmoH = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PMO, inline = "pmoh", display = display.none)
+int wPmoH = input.int(2, "", minval = 1, maxval = 4, group = GRP_PMO, inline = "pmoh", display = display.none)
+
+bool showPmoL = input.bool(true, "Show PMoL", group = GRP_PMO, inline = "pmol")
+string styPmoL = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PMO, inline = "pmol", display = display.none)
+int wPmoL = input.int(2, "", minval = 1, maxval = 4, group = GRP_PMO, inline = "pmol", display = display.none)
+
+// =========================================================================
+// INPUTS — Premarket
+// =========================================================================
+string GRP_PM = "Premarket (PMH / PML)"
+string pmSession = input.session("0400-0930", "Premarket session", group = GRP_PM, display = display.none)
+
+bool showPmh = input.bool(true, "Show PMH", group = GRP_PM, inline = "pmh")
+color colPmh = input.color(color.new(#2196f3, 0), "", group = GRP_PM, inline = "pmh")
+string styPmh = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PM, inline = "pmh", display = display.none)
+int wPmh = input.int(2, "", minval = 1, maxval = 4, group = GRP_PM, inline = "pmh", display = display.none)
+
+bool showPml = input.bool(true, "Show PML", group = GRP_PM, inline = "pml")
+string styPml = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_PM, inline = "pml", display = display.none)
+int wPml = input.int(2, "", minval = 1, maxval = 4, group = GRP_PM, inline = "pml", display = display.none)
+
+// =========================================================================
+// INPUTS — Opening Range (ORB)
+// =========================================================================
+string GRP_ORB = "Opening Range (ORB)"
+bool showOrb1H = input.bool(true, "Show 1st Candle High", group = GRP_ORB, inline = "o1h")
+color colOrb1H = input.color(color.new(#ab47bc, 0), "", group = GRP_ORB, inline = "o1h")
+string styOrb1H = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o1h", display = display.none)
+int wOrb1H = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o1h", display = display.none)
+
+bool showOrb1L = input.bool(true, "Show 1st Candle Low", group = GRP_ORB, inline = "o1l")
+string styOrb1L = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o1l", display = display.none)
+int wOrb1L = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o1l", display = display.none)
+
+bool showOrb5H = input.bool(true, "Show 5mH", group = GRP_ORB, inline = "o5h")
+color colOrb5H = input.color(color.new(#00bcd4, 0), "", group = GRP_ORB, inline = "o5h")
+string styOrb5H = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o5h", display = display.none)
+int wOrb5H = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o5h", display = display.none)
+
+bool showOrb5L = input.bool(true, "Show 5mL", group = GRP_ORB, inline = "o5l")
+string styOrb5L = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o5l", display = display.none)
+int wOrb5L = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o5l", display = display.none)
+
+bool showOrb15H = input.bool(false, "Show 15mH", group = GRP_ORB, inline = "o15h")
+color colOrb15H = input.color(color.new(#9c27b0, 0), "", group = GRP_ORB, inline = "o15h")
+string styOrb15H = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o15h", display = display.none)
+int wOrb15H = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o15h", display = display.none)
+
+bool showOrb15L = input.bool(false, "Show 15mL", group = GRP_ORB, inline = "o15l")
+string styOrb15L = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o15l", display = display.none)
+int wOrb15L = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o15l", display = display.none)
+
+bool showOrb30H = input.bool(false, "Show 30mH", group = GRP_ORB, inline = "o30h")
+color colOrb30H = input.color(color.new(#e91e63, 0), "", group = GRP_ORB, inline = "o30h")
+string styOrb30H = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o30h", display = display.none)
+int wOrb30H = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o30h", display = display.none)
+
+bool showOrb30L = input.bool(false, "Show 30mL", group = GRP_ORB, inline = "o30l")
+string styOrb30L = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o30l", display = display.none)
+int wOrb30L = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o30l", display = display.none)
+
+bool showOrb1hH = input.bool(false, "Show 1HH", group = GRP_ORB, inline = "o1hh")
+color colOrb1hH = input.color(color.new(#3f51b5, 0), "", group = GRP_ORB, inline = "o1hh")
+string styOrb1hH = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o1hh", display = display.none)
+int wOrb1hH = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o1hh", display = display.none)
+
+bool showOrb1hL = input.bool(false, "Show 1HL", group = GRP_ORB, inline = "o1hl")
+string styOrb1hL = input.string("Solid", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ORB, inline = "o1hl", display = display.none)
+int wOrb1hL = input.int(2, "", minval = 1, maxval = 4, group = GRP_ORB, inline = "o1hl", display = display.none)
+
+// =========================================================================
+// INPUTS — Intraday H/L
+// =========================================================================
+string GRP_ID = "Intraday High / Low"
+bool showIdH = input.bool(true, "Show Intraday High", group = GRP_ID, inline = "idh")
+color colIdH = input.color(color.new(#4caf50, 0), "", group = GRP_ID, inline = "idh")
+string styIdH = input.string("Dashed", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ID, inline = "idh", display = display.none)
+int wIdH = input.int(2, "", minval = 1, maxval = 4, group = GRP_ID, inline = "idh", display = display.none)
+
+bool showIdL = input.bool(true, "Show Intraday Low", group = GRP_ID, inline = "idl")
+string styIdL = input.string("Dashed", "", options = ["Solid", "Dashed", "Dotted"], group = GRP_ID, inline = "idl", display = display.none)
+int wIdL = input.int(2, "", minval = 1, maxval = 4, group = GRP_ID, inline = "idl", display = display.none)
+
+string idSessionMode = input.string("RTH only", "Intraday range session", options = ["RTH only", "Premarket + RTH"], group = GRP_ID, display = display.none)
+
+// =========================================================================
+// INPUTS — Gap
+// =========================================================================
+string GRP_GAP = "Gap (PDC → Open)"
+bool showGap = input.bool(true, "Show gap box", group = GRP_GAP)
+color gapBorder = input.color(color.new(#787b86, 0), "Gap border color", group = GRP_GAP)
+color gapFill = input.color(color.new(#787b86, 85), "Gap fill color", group = GRP_GAP)
+int gapBorderWidth = input.int(3, "Gap border width", minval = 1, maxval = 4, group = GRP_GAP, display = display.none)
+bool showGapLabel = input.bool(true, "Show gap label", group = GRP_GAP)
+
+// =========================================================================
+// INPUTS — VWAP
+// =========================================================================
+string GRP_VWAP = "VWAP"
+bool showVwap = input.bool(true, "Show VWAP", group = GRP_VWAP, inline = "vw")
+color colVwap = input.color(color.new(#ef5350, 0), "", group = GRP_VWAP, inline = "vw")
+int wVwap = input.int(2, "", minval = 1, maxval = 4, group = GRP_VWAP, inline = "vw", display = display.none)
+string vwapAnchor = input.string("Session (incl. premarket)", "VWAP anchor", options = ["RTH open", "Session (incl. premarket)"], group = GRP_VWAP, display = display.none)
+bool showVwapBands = input.bool(false, "Show VWAP ±1 / ±2 bands", group = GRP_VWAP,
+     tooltip = "Band color is fixed here to stay under Pine's 64-plot budget. Recolor the bands in the Style tab.")
+// Constant color on purpose: an input color makes each band plot count double toward the 64-plot limit.
+color colVwapBand = color.new(#ffeb3b, 60)
+
+// =========================================================================
+// INPUTS — EMAs (up to 8)
+// =========================================================================
+string GRP_EMA = "EMAs"
+bool showEma1 = input.bool(true, "EMA 1", group = GRP_EMA, inline = "e1")
+int lenEma1 = input.int(9, "", minval = 1, group = GRP_EMA, inline = "e1", display = display.none)
+color colEma1 = input.color(color.new(#26a69a, 0), "", group = GRP_EMA, inline = "e1")
+int wEma1 = input.int(2, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e1", display = display.none)
+
+bool showEma2 = input.bool(true, "EMA 2", group = GRP_EMA, inline = "e2")
+int lenEma2 = input.int(20, "", minval = 1, group = GRP_EMA, inline = "e2", display = display.none)
+color colEma2 = input.color(color.new(#ff9800, 0), "", group = GRP_EMA, inline = "e2")
+int wEma2 = input.int(2, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e2", display = display.none)
+
+bool showEma3 = input.bool(true, "EMA 3", group = GRP_EMA, inline = "e3")
+int lenEma3 = input.int(50, "", minval = 1, group = GRP_EMA, inline = "e3", display = display.none)
+color colEma3 = input.color(color.new(#ffeb3b, 0), "", group = GRP_EMA, inline = "e3")
+int wEma3 = input.int(2, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e3", display = display.none)
+
+bool showEma4 = input.bool(false, "EMA 4", group = GRP_EMA, inline = "e4")
+int lenEma4 = input.int(100, "", minval = 1, group = GRP_EMA, inline = "e4", display = display.none)
+color colEma4 = input.color(color.new(#9c27b0, 0), "", group = GRP_EMA, inline = "e4")
+int wEma4 = input.int(1, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e4", display = display.none)
+
+bool showEma5 = input.bool(false, "EMA 5", group = GRP_EMA, inline = "e5")
+int lenEma5 = input.int(200, "", minval = 1, group = GRP_EMA, inline = "e5", display = display.none)
+color colEma5 = input.color(color.new(#607d8b, 0), "", group = GRP_EMA, inline = "e5")
+int wEma5 = input.int(1, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e5", display = display.none)
+
+bool showEma6 = input.bool(false, "EMA 6", group = GRP_EMA, inline = "e6")
+int lenEma6 = input.int(8, "", minval = 1, group = GRP_EMA, inline = "e6", display = display.none)
+color colEma6 = input.color(color.new(#00bcd4, 0), "", group = GRP_EMA, inline = "e6")
+int wEma6 = input.int(1, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e6", display = display.none)
+
+bool showEma7 = input.bool(false, "EMA 7", group = GRP_EMA, inline = "e7")
+int lenEma7 = input.int(13, "", minval = 1, group = GRP_EMA, inline = "e7", display = display.none)
+color colEma7 = input.color(color.new(#8bc34a, 0), "", group = GRP_EMA, inline = "e7")
+int wEma7 = input.int(1, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e7", display = display.none)
+
+bool showEma8 = input.bool(false, "EMA 8", group = GRP_EMA, inline = "e8")
+int lenEma8 = input.int(34, "", minval = 1, group = GRP_EMA, inline = "e8", display = display.none)
+color colEma8 = input.color(color.new(#ffc107, 0), "", group = GRP_EMA, inline = "e8")
+int wEma8 = input.int(1, "", minval = 1, maxval = 4, group = GRP_EMA, inline = "e8", display = display.none)
+
+// =========================================================================
+// HELPERS
+// =========================================================================
+f_ls(s) =>
+    s == "Dashed" ? plot.linestyle_dashed : s == "Dotted" ? plot.linestyle_dotted : plot.linestyle_solid
+
+f_lineStyle(s) =>
+    s == "Dashed" ? line.style_dashed : s == "Dotted" ? line.style_dotted : line.style_solid
+
+// Short horizontal mark ending at the latest bar, plus an optional label.
+// Used for weekly / monthly levels so they never stretch back to the candle that set them.
+// Bar-index anchored, so it pans and zooms with the chart. Costs zero plot counts.
+f_mark(show, price, col, width, sty, title) =>
+    var line ln = na
+    var label lb = na
+    bool on = show and barstate.islast and not na(price)
+    bool lbOn = on and showLabels
+    int x1 = math.max(bar_index - markBars, 0)
+    string txt = title + " " + str.tostring(price, format.mintick)
+    if on and na(ln)
+        ln := line.new(x1, price, bar_index, price, xloc.bar_index, extend.none, col, f_lineStyle(sty), width)
+    if on and not na(ln)
+        line.set_xy1(ln, x1, price)
+        line.set_xy2(ln, bar_index, price)
+        line.set_color(ln, col)
+        line.set_style(ln, f_lineStyle(sty))
+        line.set_width(ln, width)
+    if not on and not na(ln)
+        line.delete(ln)
+        ln := na
+    if lbOn and na(lb)
+        lb := label.new(bar_index, price, txt, xloc.bar_index, yloc.price, col, label.style_label_left, color.white, labelSize)
+    if lbOn and not na(lb)
+        label.set_xy(lb, bar_index, price)
+        label.set_text(lb, txt)
+        label.set_color(lb, col)
+        label.set_textcolor(lb, color.white)
+        label.set_size(lb, labelSize)
+    if not lbOn and not na(lb)
+        label.delete(lb)
+        lb := na
+
+f_tag(show, price, col, title) =>
+    var label lb = na
+    bool on = show and barstate.islast and not na(price)
+    string txt = title + " " + str.tostring(price, format.mintick)
+    if on and na(lb)
+        lb := label.new(bar_index, price, txt, style = label.style_label_left, color = col, textcolor = color.white, size = labelSize)
+    if on and not na(lb)
+        label.set_xy(lb, bar_index, price)
+        label.set_text(lb, txt)
+        label.set_color(lb, col)
+        label.set_textcolor(lb, color.white)
+        label.set_size(lb, labelSize)
+    if not on and not na(lb)
+        label.delete(lb)
+        lb := na
+
+// =========================================================================
+// SESSION FLAGS
+// =========================================================================
+int etDate = year(time, sessionTz) * 10000 + month(time, sessionTz) * 100 + dayofmonth(time, sessionTz)
+int prevEtDate = year(time[1], sessionTz) * 10000 + month(time[1], sessionTz) * 100 + dayofmonth(time[1], sessionTz)
+bool newDay = na(time[1]) or etDate != prevEtDate
+bool isWeekday = dayofweek(time, sessionTz) >= dayofweek.monday and dayofweek(time, sessionTz) <= dayofweek.friday
+int weekId = year(time, sessionTz) * 100 + weekofyear(time, sessionTz)
+int prevWeekId = year(time[1], sessionTz) * 100 + weekofyear(time[1], sessionTz)
+bool newWeek = na(time[1]) or weekId != prevWeekId
+int monthId = year(time, sessionTz) * 100 + month(time, sessionTz)
+int prevMonthId = year(time[1], sessionTz) * 100 + month(time[1], sessionTz)
+bool newMonth = na(time[1]) or monthId != prevMonthId
+// ET date of the chart's latest bar. With "Last day only", daily levels draw on this date alone.
+int lastEtDate = year(last_bar_time, sessionTz) * 10000 + month(last_bar_time, sessionTz) * 100 + dayofmonth(last_bar_time, sessionTz)
+bool levelDay = levelDaysMode == "All days" or etDate == lastEtDate
+bool inPM  = isWeekday and not na(time(timeframe.period, pmSession + ":23456", sessionTz))
+bool inRTH = isWeekday and not na(time(timeframe.period, "0930-1600:23456", sessionTz))
+bool inOrb1  = isWeekday and not na(time(timeframe.period, "0930-0931:23456", sessionTz))
+bool inOrb5  = isWeekday and not na(time(timeframe.period, "0930-0935:23456", sessionTz))
+bool inOrb15 = isWeekday and not na(time(timeframe.period, "0930-0945:23456", sessionTz))
+bool inOrb30 = isWeekday and not na(time(timeframe.period, "0930-1000:23456", sessionTz))
+bool inOrb1h = isWeekday and not na(time(timeframe.period, "0930-1030:23456", sessionTz))
+bool rthStart = inRTH and not inRTH[1]
+
+// =========================================================================
+// LEVEL ENGINE
+// =========================================================================
+var float pdh = na
+var float pdl = na
+var float pdc = na
+var float pwh = na
+var float pwl = na
+var float weekH = na
+var float weekL = na
+var float pmoH = na
+var float pmoL = na
+var float monthH = na
+var float monthL = na
+var float sessH = na
+var float sessL = na
+var float lastRthClose = na
+var float dayOpen = na
+var float pmH = na
+var float pmL = na
+var float orb1H = na
+var float orb1L = na
+var float orb5H = na
+var float orb5L = na
+var float orb15H = na
+var float orb15L = na
+var float orb30H = na
+var float orb30L = na
+var float orb1hH = na
+var float orb1hL = na
+var float idH = na
+var float idL = na
+
+var int dayStartBar = na
+var int rthStartBar = na
+var int pmStartBar = na
+
+if newDay
+    if not na(sessH)
+        pdh := sessH
+        pdl := sessL
+    if not na(lastRthClose)
+        pdc := lastRthClose
+    sessH := na
+    sessL := na
+    lastRthClose := na
+    dayOpen := na
+    pmH := na
+    pmL := na
+    orb1H := na
+    orb1L := na
+    orb5H := na
+    orb5L := na
+    orb15H := na
+    orb15L := na
+    orb30H := na
+    orb30L := na
+    orb1hH := na
+    orb1hL := na
+    idH := na
+    idL := na
+    dayStartBar := bar_index
+    rthStartBar := na
+    pmStartBar := na
+
+if inPM
+    if na(pmStartBar)
+        pmStartBar := bar_index
+    pmH := na(pmH) ? high : math.max(pmH, high)
+    pmL := na(pmL) ? low  : math.min(pmL, low)
+
+if rthStart
+    dayOpen := open
+    rthStartBar := bar_index
+
+if newWeek
+    if not na(weekH)
+        pwh := weekH
+        pwl := weekL
+    weekH := na
+    weekL := na
+
+if newMonth
+    if not na(monthH)
+        pmoH := monthH
+        pmoL := monthL
+    monthH := na
+    monthL := na
+
+if inRTH
+    sessH := na(sessH) ? high : math.max(sessH, high)
+    sessL := na(sessL) ? low  : math.min(sessL, low)
+    lastRthClose := close
+    weekH := na(weekH) ? high : math.max(weekH, high)
+    weekL := na(weekL) ? low  : math.min(weekL, low)
+    monthH := na(monthH) ? high : math.max(monthH, high)
+    monthL := na(monthL) ? low  : math.min(monthL, low)
+
+if inOrb1
+    orb1H := na(orb1H) ? high : math.max(orb1H, high)
+    orb1L := na(orb1L) ? low  : math.min(orb1L, low)
+if inOrb5
+    orb5H := na(orb5H) ? high : math.max(orb5H, high)
+    orb5L := na(orb5L) ? low  : math.min(orb5L, low)
+if inOrb15
+    orb15H := na(orb15H) ? high : math.max(orb15H, high)
+    orb15L := na(orb15L) ? low  : math.min(orb15L, low)
+if inOrb30
+    orb30H := na(orb30H) ? high : math.max(orb30H, high)
+    orb30L := na(orb30L) ? low  : math.min(orb30L, low)
+if inOrb1h
+    orb1hH := na(orb1hH) ? high : math.max(orb1hH, high)
+    orb1hL := na(orb1hL) ? low  : math.min(orb1hL, low)
+
+bool trackId = idSessionMode == "RTH only" ? inRTH : (inPM or inRTH)
+if trackId
+    idH := na(idH) ? high : math.max(idH, high)
+    idL := na(idL) ? low  : math.min(idL, low)
+
+// =========================================================================
+// VWAP
+// =========================================================================
+bool vwapReset = vwapAnchor == "RTH open" ? rthStart : newDay
+var float vwapSumPV = na
+var float vwapSumV = na
+var float vwapSumP2V = na
+
+if vwapReset
+    vwapSumPV := hlc3 * volume
+    vwapSumV := volume
+    vwapSumP2V := hlc3 * hlc3 * volume
+else if (vwapAnchor == "RTH open" and inRTH) or (vwapAnchor != "RTH open" and (inPM or inRTH))
+    vwapSumPV += hlc3 * volume
+    vwapSumV += volume
+    vwapSumP2V += hlc3 * hlc3 * volume
+
+float vwapVal = vwapSumV > 0 ? vwapSumPV / vwapSumV : na
+float vwapVar = vwapSumV > 0 ? vwapSumP2V / vwapSumV - vwapVal * vwapVal : na
+float vwapDev = not na(vwapVar) and vwapVar > 0 ? math.sqrt(vwapVar) : na
+
+plot(showVwap ? vwapVal : na, "VWAP", color = colVwap, linewidth = wVwap, style = plot.style_line)
+plot(showVwap and showVwapBands ? vwapVal + vwapDev : na, "VWAP +1σ", color = colVwapBand, style = plot.style_line)
+plot(showVwap and showVwapBands ? vwapVal - vwapDev : na, "VWAP −1σ", color = colVwapBand, style = plot.style_line)
+plot(showVwap and showVwapBands ? vwapVal + 2 * vwapDev : na, "VWAP +2σ", color = colVwapBand, style = plot.style_linebr)
+plot(showVwap and showVwapBands ? vwapVal - 2 * vwapDev : na, "VWAP −2σ", color = colVwapBand, style = plot.style_linebr)
+
+// =========================================================================
+// EMAs
+// =========================================================================
+plot(showEma1 ? ta.ema(close, lenEma1) : na, "EMA 1", color = colEma1, linewidth = wEma1)
+plot(showEma2 ? ta.ema(close, lenEma2) : na, "EMA 2", color = colEma2, linewidth = wEma2)
+plot(showEma3 ? ta.ema(close, lenEma3) : na, "EMA 3", color = colEma3, linewidth = wEma3)
+plot(showEma4 ? ta.ema(close, lenEma4) : na, "EMA 4", color = colEma4, linewidth = wEma4)
+plot(showEma5 ? ta.ema(close, lenEma5) : na, "EMA 5", color = colEma5, linewidth = wEma5)
+plot(showEma6 ? ta.ema(close, lenEma6) : na, "EMA 6", color = colEma6, linewidth = wEma6)
+plot(showEma7 ? ta.ema(close, lenEma7) : na, "EMA 7", color = colEma7, linewidth = wEma7)
+plot(showEma8 ? ta.ema(close, lenEma8) : na, "EMA 8", color = colEma8, linewidth = wEma8)
+
+// =========================================================================
+// DAILY LEVELS ON THE BARS — same as EMA / VWAP, so they scroll and scale with price
+// Drawn only inside the levels window (default 04:00–16:00 ET) and, with
+// "Last day only", only on the most recent trading day. Gap fill is 09:30–16:00 ET.
+// =========================================================================
+bool inLevelBars = isWeekday and levelDay and not na(time(timeframe.period, levelSession + ":23456", sessionTz))
+bool inGapBars = isWeekday and levelDay and not na(time(timeframe.period, "0930-1600:23456", sessionTz))
+
+f_on(show, price) =>
+    show and inLevelBars and not na(price) ? price : na
+
+plot(f_on(showPdh, pdh), "PrevDay High", colPdh, wPdh, plot.style_linebr, linestyle = f_ls(styPdh))
+plot(f_on(showPdl, pdl), "PrevDay Low", colPdh, wPdl, plot.style_linebr, linestyle = f_ls(styPdl))
+plot(f_on(showPdc, pdc), "Prev Close", colPdc, wPdc, plot.style_linebr, linestyle = f_ls(styPdc))
+plot(f_on(showPmh, pmH), "PM High", colPmh, wPmh, plot.style_linebr, linestyle = f_ls(styPmh))
+plot(f_on(showPml, pmL), "PM Low", colPmh, wPml, plot.style_linebr, linestyle = f_ls(styPml))
+plot(f_on(showOrb1H, orb1H), "1st Candle High", colOrb1H, wOrb1H, plot.style_linebr, linestyle = f_ls(styOrb1H))
+plot(f_on(showOrb1L, orb1L), "1st Candle Low", colOrb1H, wOrb1L, plot.style_linebr, linestyle = f_ls(styOrb1L))
+plot(f_on(showOrb5H, orb5H), "5m High", colOrb5H, wOrb5H, plot.style_linebr, linestyle = f_ls(styOrb5H))
+plot(f_on(showOrb5L, orb5L), "5m Low", colOrb5H, wOrb5L, plot.style_linebr, linestyle = f_ls(styOrb5L))
+plot(f_on(showOrb15H, orb15H), "15m High", colOrb15H, wOrb15H, plot.style_linebr, linestyle = f_ls(styOrb15H))
+plot(f_on(showOrb15L, orb15L), "15m Low", colOrb15H, wOrb15L, plot.style_linebr, linestyle = f_ls(styOrb15L))
+plot(f_on(showOrb30H, orb30H), "30m High", colOrb30H, wOrb30H, plot.style_linebr, linestyle = f_ls(styOrb30H))
+plot(f_on(showOrb30L, orb30L), "30m Low", colOrb30H, wOrb30L, plot.style_linebr, linestyle = f_ls(styOrb30L))
+plot(f_on(showOrb1hH, orb1hH), "1H High", colOrb1hH, wOrb1hH, plot.style_linebr, linestyle = f_ls(styOrb1hH))
+plot(f_on(showOrb1hL, orb1hL), "1H Low", colOrb1hH, wOrb1hL, plot.style_linebr, linestyle = f_ls(styOrb1hL))
+plot(f_on(showIdH, idH), "Intraday High", colIdH, wIdH, plot.style_linebr, linestyle = f_ls(styIdH))
+plot(f_on(showIdL, idL), "Intraday Low", colIdH, wIdL, plot.style_linebr, linestyle = f_ls(styIdL))
+
+// Weekly / monthly: short marks at the latest bar (never extended back to the source candle).
+f_mark(showPwh, pwh, colPwh, wPwh, styPwh, "Prev week high")
+f_mark(showPwl, pwl, colPwh, wPwl, styPwl, "Prev week low")
+f_mark(showPmoH, pmoH, colPmoH, wPmoH, styPmoH, "Prev month high")
+f_mark(showPmoL, pmoL, colPmoH, wPmoL, styPmoL, "Prev month low")
+
+// Daily level pills on the latest bar. Gated by the day (not the time window) so they
+// stay visible after the window closes, as long as the latest bar is still that day.
+bool tagOn = showLabels and isWeekday and levelDay
+f_tag(tagOn and showPdh, pdh, colPdh, "PrevDay High")
+f_tag(tagOn and showPdl, pdl, colPdh, "PrevDay Low")
+f_tag(tagOn and showPdc, pdc, colPdc, "Prev Close")
+f_tag(tagOn and showPmh, pmH, colPmh, "PM High")
+f_tag(tagOn and showPml, pmL, colPmh, "PM Low")
+f_tag(tagOn and showOrb1H, orb1H, colOrb1H, "1st Candle High")
+f_tag(tagOn and showOrb1L, orb1L, colOrb1H, "1st Candle Low")
+f_tag(tagOn and showOrb5H, orb5H, colOrb5H, "5m High")
+f_tag(tagOn and showOrb5L, orb5L, colOrb5H, "5m Low")
+f_tag(tagOn and showOrb15H, orb15H, colOrb15H, "15m High")
+f_tag(tagOn and showOrb15L, orb15L, colOrb15H, "15m Low")
+f_tag(tagOn and showOrb30H, orb30H, colOrb30H, "30m High")
+f_tag(tagOn and showOrb30L, orb30L, colOrb30H, "30m Low")
+f_tag(tagOn and showOrb1hH, orb1hH, colOrb1hH, "1H High")
+f_tag(tagOn and showOrb1hL, orb1hL, colOrb1hH, "1H Low")
+f_tag(tagOn and showIdH, idH, colIdH, "Intraday High")
+f_tag(tagOn and showIdL, idL, colIdH, "Intraday Low")
+
+bool gapExists = showGap and not na(pdc) and not na(dayOpen) and pdc != dayOpen
+bool gapOk = gapExists and inGapBars
+float gapTop = gapOk ? math.max(pdc, dayOpen) : na
+float gapBot = gapOk ? math.min(pdc, dayOpen) : na
+gapHi = plot(gapTop, "Gap high", gapBorder, gapBorderWidth, plot.style_linebr, linestyle = plot.linestyle_dotted)
+gapLo = plot(gapBot, "Gap low", gapBorder, gapBorderWidth, plot.style_linebr, linestyle = plot.linestyle_dotted)
+// Input color (not series) so this fill adds zero plot counts. gapTop/gapBot are na outside the gap window, so nothing fills there.
+fill(gapHi, gapLo, gapFill, title = "Gap")
+
+var label gapLbl = na
+bool gapTag = showGapLabel and gapExists and isWeekday and levelDay and barstate.islast
+float gapMid = gapExists ? (math.max(pdc, dayOpen) + math.min(pdc, dayOpen)) / 2 : na
+float gapPts = gapExists ? dayOpen - pdc : na
+string gapTxt = not gapTag ? "" : (gapPts > 0 ? "Gap Up " : "Gap Down ") + str.tostring(math.abs(gapPts), format.mintick)
+if gapTag and na(gapLbl)
+    gapLbl := label.new(bar_index, gapMid, gapTxt, style = label.style_label_left, color = gapBorder, textcolor = color.white, size = labelSize)
+if gapTag and not na(gapLbl)
+    label.set_xy(gapLbl, bar_index, gapMid)
+    label.set_text(gapLbl, gapTxt)
+    label.set_color(gapLbl, gapBorder)
+    label.set_textcolor(gapLbl, color.white)
+    label.set_size(gapLbl, labelSize)
+if not gapTag and not na(gapLbl)
+    label.delete(gapLbl)
+    gapLbl := na

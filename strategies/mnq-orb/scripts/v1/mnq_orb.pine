@@ -1,0 +1,224 @@
+//@version=6
+// MNQ 5-Minute ORB v1.1.0
+
+strategy(
+     title                   = "MNQ 5-Minute ORB",
+     shorttitle              = "MNQ ORB",
+     overlay                 = true,
+     pyramiding              = 0,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 10,
+     initial_capital         = 625000,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 0.62,
+     slippage                = 1,
+     calc_on_order_fills     = true,
+     process_orders_on_close = true)
+
+string GRP_SESSION = "Session"
+string GRP_RISK    = "Risk"
+string GRP_TARGETS = "Profit Targets"
+string GRP_FILTER  = "Filters"
+string GRP_VISUAL  = "Visuals"
+
+string sessionTz = input.string("America/New_York", "Timezone", group = GRP_SESSION)
+string rthSession = input.session("0930-1600", "Trading session", group = GRP_SESSION)
+bool closeAtSessionEnd = input.bool(true, "Close position at session end", group = GRP_SESSION)
+int maxTradesPerDay = input.int(1, "Maximum trades per day", minval = 1, maxval = 20, group = GRP_SESSION)
+int contracts = input.int(10, "Contracts", minval = 10, maxval = 100, group = GRP_RISK)
+
+float stopPoints = input.float(50.0, "Stop loss (points)", minval = 0.25, step = 0.25, group = GRP_RISK)
+bool useBreakEven = input.bool(true, "Move stop to breakeven", group = GRP_RISK)
+float breakEvenTrigger = input.float(50.0, "Breakeven trigger (points)", minval = 0.25, step = 0.25, group = GRP_RISK,
+     tooltip = "When price touches this profit, move the stop to the position's average entry price.")
+bool trailAfterTp2 = input.bool(true, "After TP2, move remaining stop to TP1", group = GRP_RISK)
+
+int targetCount = input.int(3, "Number of profit targets", minval = 1, maxval = 3, group = GRP_TARGETS)
+float tp1Points = input.float(50.0, "TP1 (points)", minval = 0.25, step = 0.25, group = GRP_TARGETS)
+int tp1Contracts = input.int(4, "TP1 contracts", minval = 1, maxval = 98, group = GRP_TARGETS,
+     tooltip = "For 2–3 targets. The script reserves at least one contract for each later target.")
+float tp2Points = input.float(100.0, "TP2 (points)", minval = 0.50, step = 0.25, group = GRP_TARGETS)
+int tp2Contracts = input.int(3, "TP2 contracts", minval = 1, maxval = 98, group = GRP_TARGETS,
+     tooltip = "Used with 3 targets. Remaining contracts are assigned to TP3.")
+float tp3Points = input.float(150.0, "TP3 (points)", minval = 0.75, step = 0.25, group = GRP_TARGETS)
+
+bool useVwapFilter = input.bool(true, "Use RTH VWAP filter", group = GRP_FILTER,
+     tooltip = "Long entries require the breakout price to be above RTH VWAP. Short entries require it to be below RTH VWAP.")
+bool useEma9Filter = input.bool(true, "Use EMA 9 filter", group = GRP_FILTER,
+     tooltip = "Long entries require breakout price above EMA 9. Short entries require breakout price below EMA 9.")
+bool useEma21Filter = input.bool(true, "Use EMA 21 filter", group = GRP_FILTER,
+     tooltip = "Long entries require breakout price above EMA 21. Short entries require breakout price below EMA 21.")
+bool useEma50Filter = input.bool(true, "Use EMA 50 filter", group = GRP_FILTER,
+     tooltip = "Long entries require breakout price above EMA 50. Short entries require breakout price below EMA 50.")
+
+bool showOpeningRange = input.bool(true, "Show opening range", group = GRP_VISUAL)
+bool showVwap = input.bool(true, "Show RTH VWAP", group = GRP_VISUAL)
+bool showEmas = input.bool(true, "Show EMA 9 / 21 / 50", group = GRP_VISUAL)
+bool shadeOpeningRange = input.bool(true, "Shade 9:30–9:35 ET", group = GRP_VISUAL)
+
+bool isFiveMinute = timeframe.isminutes and timeframe.multiplier == 5
+bool inRth = not na(time(timeframe.period, rthSession, sessionTz))
+bool inOrb = not na(time(timeframe.period, "0930-0935:23456", sessionTz))
+bool rthStart = inRth and not inRth[1]
+bool rthEndBar = inRth and time_close >= timestamp(sessionTz, year, month, dayofmonth, 16, 0)
+
+var float orbHigh = na
+var float orbLow = na
+var bool orbReady = false
+var int orbReadyBar = na
+var int tradeCount = 0
+var bool breakEvenArmed = false
+var bool tp2Hit = false
+var int lastEntryBar = na
+var int lastExitBar = na
+
+var float rthPv = na
+var float rthVolume = na
+
+if rthStart
+    orbHigh := na
+    orbLow := na
+    orbReady := false
+    orbReadyBar := na
+    tradeCount := 0
+    breakEvenArmed := false
+    tp2Hit := false
+    lastEntryBar := na
+    lastExitBar := na
+    rthPv := 0.0
+    rthVolume := 0.0
+    strategy.cancel("ORB Long")
+    strategy.cancel("ORB Short")
+
+if inRth
+    rthPv := nz(rthPv) + hlc3 * volume
+    rthVolume := nz(rthVolume) + volume
+
+float rthVwap = rthVolume > 0 ? rthPv / rthVolume : na
+float ema9 = ta.ema(close, 9)
+float ema21 = ta.ema(close, 21)
+float ema50 = ta.ema(close, 50)
+
+if inOrb
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow := na(orbLow) ? low : math.min(orbLow, low)
+    if time_close >= timestamp(sessionTz, year, month, dayofmonth, 9, 35)
+        orbReady := true
+        orbReadyBar := bar_index
+
+bool newLong = strategy.position_size > 0 and strategy.position_size[1] <= 0 and
+     (na(lastEntryBar) or bar_index != lastEntryBar)
+bool newShort = strategy.position_size < 0 and strategy.position_size[1] >= 0 and
+     (na(lastEntryBar) or bar_index != lastEntryBar)
+bool positionClosed = strategy.position_size == 0 and strategy.position_size[1] != 0 and
+     (na(lastExitBar) or bar_index != lastExitBar)
+
+if newLong or newShort
+    tradeCount += 1
+    breakEvenArmed := false
+    tp2Hit := false
+    lastEntryBar := bar_index
+    strategy.cancel(newLong ? "ORB Short" : "ORB Long")
+
+if positionClosed
+    breakEvenArmed := false
+    tp2Hit := false
+    lastExitBar := bar_index
+
+bool flat = strategy.position_size == 0
+// Arm breakouts only AFTER the 9:30–9:35 bar closes. Placing stops on the ORB bar
+// itself lets that candle fill long and/or short because it already traded both extremes.
+bool mayTrade = isFiveMinute and inRth and orbReady and not na(orbReadyBar) and bar_index > orbReadyBar and flat and tradeCount < maxTradesPerDay and
+     (na(lastEntryBar) or bar_index > lastEntryBar) and (na(lastExitBar) or bar_index > lastExitBar)
+bool longVwapOk = not useVwapFilter or (not na(rthVwap) and orbHigh > rthVwap)
+bool shortVwapOk = not useVwapFilter or (not na(rthVwap) and orbLow < rthVwap)
+bool longEmaOk = (not useEma9Filter or orbHigh > ema9) and
+     (not useEma21Filter or orbHigh > ema21) and
+     (not useEma50Filter or orbHigh > ema50)
+bool shortEmaOk = (not useEma9Filter or orbLow < ema9) and
+     (not useEma21Filter or orbLow < ema21) and
+     (not useEma50Filter or orbLow < ema50)
+
+float longStopEntry = orbHigh + syminfo.mintick
+float shortStopEntry = orbLow - syminfo.mintick
+
+if mayTrade and not rthEndBar
+    if longVwapOk and longEmaOk
+        strategy.entry("ORB Long", strategy.long, qty = contracts, stop = longStopEntry,
+             oca_name = "ORB Entry", oca_type = strategy.oca.cancel)
+    else
+        strategy.cancel("ORB Long")
+
+    if shortVwapOk and shortEmaOk
+        strategy.entry("ORB Short", strategy.short, qty = contracts, stop = shortStopEntry,
+             oca_name = "ORB Entry", oca_type = strategy.oca.cancel)
+    else
+        strategy.cancel("ORB Short")
+else
+    strategy.cancel("ORB Long")
+    strategy.cancel("ORB Short")
+
+float tp1Distance = tp1Points
+float tp2Distance = math.max(tp2Points, tp1Distance + syminfo.mintick)
+float tp3Distance = math.max(tp3Points, tp2Distance + syminfo.mintick)
+
+int tp1Qty = targetCount == 1 ? contracts : math.min(tp1Contracts, contracts - targetCount + 1)
+int remainingAfterTp1 = contracts - tp1Qty
+int tp2Qty = targetCount == 2 ? remainingAfterTp1 :
+     targetCount == 3 ? math.min(tp2Contracts, remainingAfterTp1 - 1) : 0
+int tp3Qty = targetCount == 3 ? contracts - tp1Qty - tp2Qty : 0
+float openContracts = math.abs(strategy.position_size)
+
+if strategy.position_size > 0
+    if useBreakEven and high >= strategy.position_avg_price + breakEvenTrigger
+        breakEvenArmed := true
+    if targetCount == 3 and openContracts <= tp3Qty
+        tp2Hit := true
+    float longBaseStop = breakEvenArmed ? strategy.position_avg_price : strategy.position_avg_price - stopPoints
+    float longRunnerStop = trailAfterTp2 and tp2Hit ?
+         strategy.position_avg_price + tp1Distance : longBaseStop
+    if targetCount == 1 or openContracts > contracts - tp1Qty
+        strategy.exit("Long TP1", "ORB Long", qty = tp1Qty,
+             stop = longBaseStop, limit = strategy.position_avg_price + tp1Distance)
+    if targetCount >= 2 and openContracts > (targetCount == 3 ? tp3Qty : 0)
+        strategy.exit("Long TP2", "ORB Long", qty = tp2Qty,
+             stop = longBaseStop, limit = strategy.position_avg_price + tp2Distance)
+    if targetCount == 3
+        strategy.exit("Long TP3", "ORB Long", qty = tp3Qty,
+             stop = longRunnerStop, limit = strategy.position_avg_price + tp3Distance)
+
+if strategy.position_size < 0
+    if useBreakEven and low <= strategy.position_avg_price - breakEvenTrigger
+        breakEvenArmed := true
+    if targetCount == 3 and openContracts <= tp3Qty
+        tp2Hit := true
+    float shortBaseStop = breakEvenArmed ? strategy.position_avg_price : strategy.position_avg_price + stopPoints
+    float shortRunnerStop = trailAfterTp2 and tp2Hit ?
+         strategy.position_avg_price - tp1Distance : shortBaseStop
+    if targetCount == 1 or openContracts > contracts - tp1Qty
+        strategy.exit("Short TP1", "ORB Short", qty = tp1Qty,
+             stop = shortBaseStop, limit = strategy.position_avg_price - tp1Distance)
+    if targetCount >= 2 and openContracts > (targetCount == 3 ? tp3Qty : 0)
+        strategy.exit("Short TP2", "ORB Short", qty = tp2Qty,
+             stop = shortBaseStop, limit = strategy.position_avg_price - tp2Distance)
+    if targetCount == 3
+        strategy.exit("Short TP3", "ORB Short", qty = tp3Qty,
+             stop = shortRunnerStop, limit = strategy.position_avg_price - tp3Distance)
+
+if rthEndBar
+    strategy.cancel("ORB Long")
+    strategy.cancel("ORB Short")
+    if closeAtSessionEnd and strategy.position_size != 0
+        strategy.close_all(comment = "RTH close", immediately = true)
+
+plot(showOpeningRange and orbReady ? orbHigh : na, "ORB High", color = color.lime, linewidth = 2, style = plot.style_linebr)
+plot(showOpeningRange and orbReady ? orbLow : na, "ORB Low", color = color.red, linewidth = 2, style = plot.style_linebr)
+plot(showVwap and inRth ? rthVwap : na, "RTH VWAP", color = color.aqua, linewidth = 2, style = plot.style_linebr)
+plot(showEmas ? ema9 : na, "EMA 9", color = color.yellow)
+plot(showEmas ? ema21 : na, "EMA 21", color = color.orange)
+plot(showEmas ? ema50 : na, "EMA 50", color = color.purple)
+bgcolor(shadeOpeningRange and inOrb ? color.new(color.yellow, 88) : na, title = "Opening Range")
+
+if barstate.islast and not isFiveMinute
+    var table warning = table.new(position.top_right, 1, 1)
+    table.cell(warning, 0, 0, "MNQ ORB: use a 5-minute chart", bgcolor = color.red, text_color = color.white)
